@@ -1,0 +1,23 @@
+﻿Gene,Pathway
+tapA,Tryptophan Synthesis
+trpB,Tryptophan Synthesis
+pknB,Protein Phosphotylation
+qrcB,Respiratory electron transport chain
+hadC,Fatty Acid Synthesis
+hupB,Chromosome condensation
+polA,DNA Replication
+dnaN1,DNA Replication
+dnaN1_rep2,DNA Replication
+birA,Biotin ligase
+mdh,TCA cycle
+cya,Adenylate Cyclase
+dnaE1,DNA Replication
+ftsZ,Cell division
+rpsM,Ribosomal Protein
+clpPZ,Proteolysis
+sigA,Transcription
+rpoB,Transcription
+accA3,Lipid Metabolism
+dprE1,Arabinan Synthesis
+mmpL3,Lipid Metabolism
+inhA,Lipid Metabolism
