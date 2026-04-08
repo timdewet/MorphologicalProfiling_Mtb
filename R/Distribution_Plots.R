@@ -9,43 +9,28 @@ suppressPackageStartupMessages({
   library(ggridges)
 })
 
-if (file.exists("Theme.R")) source("Theme.R")
+if (file.exists("R/Theme.R")) source("R/Theme.R")
 
 set.seed(10)
 
 # ----------------------------- configuration ----------------------------------
 
 input_files <- c(
-  "input_data/data_extraction_18_03_25.csv",
-  "input_data/all_morphology_combined.csv"
+  "input_data/smeg_morphology_data.csv"  # TODO: update with actual filename
 )
 
-name_separator <- "__"
+control_labels <- c("Plasmid")  # empty vector controls
 
-control_labels <- c("NT", "No_drug")
-
-# Helper: match control labels including numbered replicates (NT_1, NT_2, ...)
+# Helper: match control labels including numbered replicates
 is_control_label <- function(x) {
   patt <- paste0("^(", paste(control_labels, collapse = "|"), ")(_.+)?$")
   str_detect(x, patt)
 }
 
-# Name corrections (same as main pipeline)
-name_corrections <- list(
-  list(experiment = "WT_Reporters_+_drug__imiB__Inn",     reporter = "iniB", knockdown = "INH"),
-  list(experiment = "WT_Reporters_+_drug__imiB__EMB",     reporter = "iniB"),
-  list(experiment = "WT_Reporters_+_drug__imiB__No_drug", reporter = "iniB"),
-  list(experiment = "WT_Reporters_+_drug__imiB__RIF",     reporter = "iniB"),
-  list(experiment = "ATC_Strains__recA__dnaW2",           knockdown = "dnaN1_rep2")
-)
-
-# Replicate groups
-replicate_groups <- list(
-  dnaN = c("ATC_Strains__recA__dnaN1", "ATC_Strains__recA__dnaW2")
-)
+name_corrections <- list()
+replicate_groups <- list()
 merge_replicates <- FALSE
 
-# Which experiment_type values identify drug-treated samples?
 drug_experiment_pattern <- "drug"
 
 # Core features to visualise
@@ -77,14 +62,29 @@ if (!dir.exists(fig_dir)) dir.create(fig_dir, recursive = TRUE)
 
 # ----------------------------- helpers ----------------------------------------
 
-parse_sample_name <- function(name, sep = "__") {
-  parts <- str_split_fixed(name, fixed(sep), n = 3)
-  tibble(
-    EXPERIMENT      = name,
-    experiment_type = parts[, 1],
-    reporter        = parts[, 2],
-    knockdown       = parts[, 3]
-  )
+parse_sample_name <- function(name, sep = NULL) {
+  stripped <- str_replace(name, "^Labelled__Drugs__", "")
+  stripped <- str_replace(stripped, "^Labelled__", "")
+
+  ctrl_match   <- str_match(stripped, "^(Plasmid)_R(\\d+)$")
+  mutant_match <- str_match(stripped, "^(MSMEG_\\d+)_R(\\d+)$")
+  drug_match   <- str_match(stripped, "^([A-Z][A-Z0-9]{1,4})_(\\d+X)_R(\\d+)$")
+
+  if (!is.na(ctrl_match[1, 1])) {
+    tibble(EXPERIMENT = name, experiment_type = "control",
+           reporter = "", knockdown = "Plasmid")
+  } else if (!is.na(mutant_match[1, 1])) {
+    tibble(EXPERIMENT = name, experiment_type = "mutant",
+           reporter = "", knockdown = mutant_match[1, 2])
+  } else if (!is.na(drug_match[1, 1])) {
+    tibble(EXPERIMENT = name, experiment_type = "drug",
+           reporter = "",
+           knockdown = paste0(drug_match[1, 2], "_", drug_match[1, 3]))
+  } else {
+    warning("Cannot parse sample name: ", name)
+    tibble(EXPERIMENT = name, experiment_type = NA_character_,
+           reporter = NA_character_, knockdown = NA_character_)
+  }
 }
 
 # ----------------------------- load & parse -----------------------------------
@@ -99,7 +99,7 @@ if (length(missing) > 0) {
 }
 
 # Parse sample metadata
-meta <- map_dfr(unique(raw$EXPERIMENT), parse_sample_name, sep = name_separator)
+meta <- map_dfr(unique(raw$EXPERIMENT), parse_sample_name)
 
 # Apply name corrections
 for (fix in name_corrections) {
@@ -244,99 +244,8 @@ for (rep in reporters) {
   }
 }
 
-# -------------------- combined iniB + recA figure -----------------------------
-
-cat("Plotting combined iniB + recA figure...\n")
-
-# Colour palette: reporter x experiment type
-#   iniB ATC  = light green,  iniB drug = dark green
-#   recA ATC  = light maroon, recA drug = dark maroon
-fill_colours <- c(
-  "iniB - Knockdown"  = "#5ca05c",
-  "iniB - Drug"       = "#1a5e1a",
-  "recA - Knockdown"  = "#c46e6e",
-  "recA - Drug"       = "#7b1a1a"
-)
-
-combined <- df_long %>%
-  filter(reporter %in% c("iniB", "recA")) %>%
-  mutate(
-    type_label  = if_else(is_drug, "Drug", "Knockdown"),
-    colour_group = paste0(reporter, " - ", type_label)
-  )
-
-# Create a y-axis label combining reporter and knockdown
-combined <- combined %>%
-  mutate(y_label = paste0(reporter, " - ", knockdown))
-
-# Order y-axis: within each type, controls at top, then alphabetical
-ctrl_labels <- combined %>%
-  filter(is_control) %>%
-  distinct(y_label) %>%
-  pull(y_label) %>%
-  sort()
-other_labels <- combined %>%
-  filter(!is_control) %>%
-  distinct(y_label) %>%
-  pull(y_label) %>%
-  sort()
-level_order <- c(other_labels, ctrl_labels)
-combined <- combined %>%
-  mutate(y_label = factor(y_label, levels = level_order))
-
-# Subsample for jitter
-max_pts <- 1000
-set.seed(42)
-combined_sub <- combined %>%
-  group_by(y_label, feature_label, colour_group) %>%
-  slice_sample(n = max_pts) %>%
-  ungroup()
-
-p_combined <- ggplot(combined,
-                     aes(x = value, y = y_label,
-                         fill = colour_group)) +
-  geom_density_ridges(
-    alpha          = 0.7,
-    scale          = 0.5,
-    rel_min_height = 0.01
-  ) +
-  geom_point(
-    data     = combined_sub,
-    aes(x = value, y = y_label, colour = colour_group),
-    position = position_jitter(width = 0, height = 0.2),
-    size     = 0.3,
-    alpha    = 0.25,
-    shape    = 16
-  ) +
-  facet_grid(type_label ~ feature_label, scales = "free",
-             space = "free_y") +
-  scale_fill_manual(values = fill_colours, name = NULL) +
-  scale_colour_manual(values = fill_colours, name = NULL) +
-  guides(
-    fill   = guide_legend(override.aes = list(alpha = 0.9)),
-    colour = "none"
-  ) +
-  labs(x = NULL, y = NULL) +
-  theme_minimal(base_size = 13)
-
-if (exists("theme_Publication")) {
-  p_combined <- p_combined + theme_Publication() +
-    theme(
-      legend.position  = "bottom",
-      legend.direction = "horizontal",
-      legend.text      = element_text(size = 10),
-      strip.text       = element_text(face = "bold", size = 11),
-      axis.text.y      = element_text(size = 9),
-      plot.margin      = unit(c(5, 5, 5, 5), "mm")
-    )
-} else {
-  p_combined <- p_combined +
-    theme(legend.position = "bottom", legend.direction = "horizontal")
-}
-
-ggsave(
-  file.path(fig_dir, "distributions_combined_iniB_recA.png"),
-  plot = p_combined, width = 16, height = 8, dpi = fig_dpi
-)
+# TODO: Add M. smegmatis-specific combined figure here when conditions are known.
+# The Mtb branch had a combined iniB + recA reporter figure; replace with
+# an equivalent comparison relevant to M. smegmatis conditions.
 
 cat("Done. Figures saved to ", fig_dir, "/\n")

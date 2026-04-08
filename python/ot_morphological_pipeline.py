@@ -1,10 +1,12 @@
 """
 Optimal Transport Morphological Profiling Pipeline
 ===================================================
-Computes pairwise Wasserstein (Sinkhorn) distances between M. tuberculosis
-conditions (CRISPRi knockdowns and drug treatments) using cell-level
-morphological features from MicrobeJ.  Ranks drug–gene matches by phenotypic
-similarity and optionally tests significance via permutation.
+M. smegmatis branch.
+
+Computes pairwise Wasserstein (Sinkhorn) distances between M. smegmatis
+conditions (mutants and drug treatments) using cell-level morphological
+features from MicrobeJ.  Ranks drug–gene matches by phenotypic similarity
+and optionally tests significance via permutation.
 
 Usage:
     python ot_morphological_pipeline.py
@@ -32,23 +34,13 @@ from sklearn.decomposition import PCA
 CONFIG = {
     # --- Input ---
     "input_files": [
-        "input_data/data_extraction_18_03_25.csv",
-        "input_data/all_morphology_combined.csv",
+        "input_data/smeg_morphology_data.csv",  # TODO: update with actual filename
     ],
-    "name_separator": "__",
-    "control_labels": ["NT", "No_drug"],
+    "control_labels": ["WT", "DMSO"],  # TODO: confirm M. smegmatis controls
     "exclude_reporters": [],
 
     # --- Name corrections ---
-    # Applied after parsing.  Each dict must have "experiment" (exact match on
-    # the raw EXPERIMENT string) plus any fields to overwrite.
-    "name_corrections": [
-        {"experiment": "WT_Reporters_+_drug__imiB__Inn",     "reporter": "iniB", "knockdown": "INH"},
-        {"experiment": "WT_Reporters_+_drug__imiB__EMB",     "reporter": "iniB"},
-        {"experiment": "WT_Reporters_+_drug__imiB__No_drug", "reporter": "iniB"},
-        {"experiment": "WT_Reporters_+_drug__imiB__RIF",     "reporter": "iniB"},
-        {"experiment": "ATC_Strains__recA__dnaW2",           "knockdown": "dnaN1_rep2"},
-    ],
+    "name_corrections": [],
 
     # --- Features (29 SHAPE columns, matching R pipeline) ---
     "shape_features": [
@@ -86,7 +78,7 @@ CONFIG = {
     "fluorescence_col": "INTENSITY.ch1.mean",
 
     # --- Normalisation ---
-    "normalize_within_reporter": True,
+    "normalize_within_reporter": False,  # Not applicable — M. smegmatis has no reporter backgrounds
     # Subtract each condition's centroid so OT compares the *shape* of the
     # perturbation (direction + spread) rather than absolute position.
     # Without this, mild perturbations all match each other simply because
@@ -145,48 +137,53 @@ def load_and_parse_data(config):
     df = pd.concat(frames, ignore_index=True)
     print(f"Loaded {len(df):,} cells from {len(config['input_files'])} file(s)")
 
-    # Parse EXPERIMENT into components
-    sep = config["name_separator"]
-    parts = df["EXPERIMENT"].str.split(sep, n=2, expand=True)
-    df["experiment_type"] = parts[0]
-    df["reporter"] = parts[1]
-    df["knockdown"] = parts[2]
+    # Parse M. smegmatis EXPERIMENT names into components.
+    # EXPERIMENT values may include prefixes (Labelled__, Labelled__Drugs__)
+    # which are stripped before matching.
+    exp = df["EXPERIMENT"].str.replace(r"^Labelled__Drugs__", "", regex=True)
+    exp = exp.str.replace(r"^Labelled__", "", regex=True)
 
-    # Apply name corrections
-    for corr in config["name_corrections"]:
-        mask = df["EXPERIMENT"] == corr["experiment"]
-        for field in ("experiment_type", "reporter", "knockdown"):
-            if field in corr:
-                df.loc[mask, field] = corr[field]
+    mutant_pat = r"^(MSMEG_\d+)_R(\d+)$"
+    drug_pat = r"^([A-Z][A-Z0-9]{1,4})_(\d+X)_R(\d+)$"
+    control_pat = r"^(Plasmid)_R(\d+)$"
 
-    # Flag controls
-    ctrl_pat = "^(" + "|".join(re.escape(c) for c in config["control_labels"]) + ")(_.+)?$"
-    df["is_control"] = df["knockdown"].str.match(ctrl_pat)
+    mutant_match = exp.str.extract(mutant_pat)
+    drug_match = exp.str.extract(drug_pat)
+    control_match = exp.str.extract(control_pat)
 
-    # Flag drugs
-    df["is_drug"] = df["experiment_type"].str.contains(
-        config["drug_experiment_pattern"], case=False, na=False
-    ) & ~df["is_control"]
+    is_mutant = mutant_match[0].notna()
+    is_drug_sample = drug_match[0].notna()
+    is_ctrl = control_match[0].notna()
 
-    # Exclude reporters
-    if config["exclude_reporters"]:
-        before = len(df)
-        df = df[~df["reporter"].isin(config["exclude_reporters"])].copy()
-        print(f"Excluded reporters {config['exclude_reporters']}: "
-              f"{before - len(df):,} cells removed, {len(df):,} remaining")
+    df["experiment_type"] = ""
+    df.loc[is_mutant, "experiment_type"] = "mutant"
+    df.loc[is_drug_sample, "experiment_type"] = "drug"
+    df.loc[is_ctrl, "experiment_type"] = "control"
 
-    # Condition label = knockdown name (pools across reporters)
+    df["reporter"] = ""
+    df["knockdown"] = ""
+    df.loc[is_mutant, "knockdown"] = mutant_match.loc[is_mutant, 0]
+    df.loc[is_drug_sample, "knockdown"] = (
+        drug_match.loc[is_drug_sample, 0] + "_" + drug_match.loc[is_drug_sample, 1]
+    )
+    df.loc[is_ctrl, "knockdown"] = "Plasmid"
+
+    # Flag controls and drugs
+    df["is_control"] = is_ctrl | df["knockdown"].isin(config["control_labels"])
+    df["is_drug"] = is_drug_sample & ~df["is_control"]
+
+    # Condition label = knockdown name
     df["condition_label"] = df["knockdown"]
 
     # Summary
     n_ctrl = df["is_control"].sum()
     n_drug = df["is_drug"].sum()
-    n_gene = (~df["is_control"] & ~df["is_drug"]).sum()
+    n_mutant = (~df["is_control"] & ~df["is_drug"]).sum()
     conditions = df.loc[~df["is_control"], "condition_label"].nunique()
     print(f"Conditions: {conditions} non-control "
           f"({df.loc[df['is_drug'], 'condition_label'].nunique()} drugs, "
-          f"{df.loc[~df['is_control'] & ~df['is_drug'], 'condition_label'].nunique()} genes)")
-    print(f"Cells: {n_gene:,} gene-KD, {n_drug:,} drug, {n_ctrl:,} control")
+          f"{df.loc[~df['is_control'] & ~df['is_drug'], 'condition_label'].nunique()} mutants)")
+    print(f"Cells: {n_mutant:,} mutant, {n_drug:,} drug, {n_ctrl:,} control")
 
     return df
 
