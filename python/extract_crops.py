@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Phase 1: Crop Extraction
-========================
-Walks all segmented TIFFs, extracts 96×96 single-cell crops (phase + mask),
-and stores them in a single HDF5 file with condition metadata.
+Phase 1: Crop Extraction (M. smegmatis)
+========================================
+Walks all segmented TIFFs, extracts 128×128 single-cell crops
+(phase + ParB fluorescence + mask), and stores them in a single HDF5
+file with condition metadata.
 
 The segmented TIFFs already have quality-filtered masks (QC was applied
 during the segmentation pipeline), so no additional filtering is needed.
@@ -39,68 +40,99 @@ from label_cells import load_hyperstack
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-SUPCON_CROP_SIZE = CONFIG["crop_size"]   # 96
-CROP_PAD = CONFIG["crop_pad"]            # 10
+CROP_SIZE = CONFIG["crop_size"]     # 128
+CROP_PAD = CONFIG["crop_pad"]       # 10
+N_CHANNELS = CONFIG["supcon_input_channels"]  # 3
 
 
 # ── Condition parsing ────────────────────────────────────────────────────────
+
+# After stripping "Labelled__" and "Drugs__" prefixes:
+#   Mutant:  MSMEG_XXXX_RY       (e.g. MSMEG_1234_R1)
+#   Drug:    ZZZ_AXX_RY          (e.g. BDQ_025X_R1, INH_1X_R2)
+#   Control: Plasmid_RY          (e.g. Plasmid_R1)
+_MUTANT_RE = re.compile(r"^(MSMEG_\d+)_R(\d+)$")
+_DRUG_RE = re.compile(r"^([A-Z][A-Z0-9]{1,4})_(\d+X)_R(\d+)$")
+_CONTROL_RE = re.compile(r"^(Plasmid)_R(\d+)$")
+
+
+def _strip_prefix(stem):
+    """Strip 'Labelled__' and 'Drugs__' prefixes from filename stem."""
+    if stem.startswith("Labelled__Drugs__"):
+        return stem[len("Labelled__Drugs__"):]
+    if stem.startswith("Labelled__"):
+        return stem[len("Labelled__"):]
+    return stem
+
 
 def parse_condition_from_filename(stem):
     """
     Parse condition metadata from a TIFF filename stem.
 
-    Filename format: ExperimentType__Reporter__Knockdown
-    Example: ATC_Strains__cydA__menH  →  experiment_type='ATC_Strains',
-             reporter='cydA', knockdown='menH'
+    Raw filenames have prefixes (Labelled__, Labelled__Drugs__) that are
+    stripped before parsing. The meaningful part follows these patterns:
+        Mutants:  MSMEG_XXXX_RY   → gene accession + replica
+        Drugs:    ZZZ_AX_RY       → drug code + concentration (xMIC) + replica
+        Controls: Plasmid_RY      → empty vector control + replica
 
-    Handles replicate suffixes: NT_1, NT_2, etc. → condition_label='NT'
-
-    Returns dict with keys: experiment_type, reporter, knockdown,
-        condition_label, is_control, is_drug.
+    Returns dict with keys: condition_label, condition_type, gene, drug,
+        concentration, replica, is_control, is_drug.
     """
-    sep = CONFIG["name_separator"]
-    parts = stem.split(sep, maxsplit=2)
-
-    if len(parts) != 3:
-        raise ValueError(f"Cannot parse filename '{stem}' — expected 3 parts "
-                         f"separated by '{sep}', got {len(parts)}")
-
-    meta = {
-        "experiment_type": parts[0],
-        "reporter": parts[1],
-        "knockdown": parts[2],
-    }
+    name = _strip_prefix(stem)
 
     # Apply name corrections
     for corr in CONFIG["name_corrections"]:
-        if stem == corr["stem"]:
-            for field in ("experiment_type", "reporter", "knockdown"):
-                if field in corr:
-                    meta[field] = corr[field]
+        if stem == corr.get("stem"):
+            name = _strip_prefix(corr.get("corrected_stem", stem))
+            break
 
-    # Condition label = knockdown name, with replicate suffixes stripped
-    # e.g. NT_1, NT_2 → NT; dnaN1_rep2 stays as-is (that's a correction)
-    kd = meta["knockdown"]
-    ctrl_labels = CONFIG["control_labels"]
-    ctrl_pat = re.compile(
-        r"^(" + "|".join(re.escape(c) for c in ctrl_labels) + r")(_\d+)?$"
-    )
+    meta = {
+        "gene": "",
+        "drug": "",
+        "concentration": "",
+        "replica": "",
+        "condition_type": "",
+        "condition_label": "",
+        "is_control": False,
+        "is_drug": False,
+    }
 
-    m = ctrl_pat.match(kd)
+    # Try control pattern (Plasmid_RY)
+    m = _CONTROL_RE.match(name)
     if m:
-        meta["condition_label"] = m.group(1)  # strip _N suffix
+        meta["replica"] = m.group(2)
+        meta["condition_type"] = "control"
+        meta["condition_label"] = "Plasmid"
         meta["is_control"] = True
-    else:
-        meta["condition_label"] = kd
-        meta["is_control"] = False
+        return meta
 
-    meta["is_drug"] = (
-        CONFIG["drug_experiment_pattern"].lower()
-        in meta["experiment_type"].lower()
-        and not meta["is_control"]
+    # Try mutant pattern (MSMEG_XXXX_RY)
+    m = _MUTANT_RE.match(name)
+    if m:
+        gene = m.group(1)
+        meta["gene"] = gene
+        meta["replica"] = m.group(2)
+        meta["condition_type"] = "mutant"
+        meta["condition_label"] = gene
+        return meta
+
+    # Try drug pattern (ZZZ_AX_RY)
+    m = _DRUG_RE.match(name)
+    if m:
+        drug = m.group(1)
+        concentration = m.group(2)
+        meta["drug"] = drug
+        meta["concentration"] = concentration
+        meta["replica"] = m.group(3)
+        meta["condition_type"] = "drug"
+        meta["condition_label"] = f"{drug}_{concentration}"
+        meta["is_drug"] = True
+        return meta
+
+    raise ValueError(
+        f"Cannot parse filename '{stem}' (stripped: '{name}') — "
+        f"expected MSMEG_XXXX_RY, ZZZ_AX_RY, or Plasmid_RY"
     )
-
-    return meta
 
 
 # ── TIFF discovery ───────────────────────────────────────────────────────────
@@ -138,29 +170,27 @@ def discover_tiff_files():
     return all_files
 
 
-# ── Crop extraction (96×96) ─────────────────────────────────────────────────
+# ── Crop extraction (128×128, 3-channel) ──────────────────────────────────
 
-def extract_cell_crop_96(image_channels, labeled_mask, cell_label,
-                         phase_channel, pad=CROP_PAD, mask_background=True,
-                         dilate_px=3):
+def extract_cell_crop(image_channels, labeled_mask, cell_label,
+                      phase_ch, fluor_ch, pad=CROP_PAD,
+                      mask_background=True, dilate_px=3):
     """
-    Extract a 96×96 crop of a single cell from multi-channel image data.
-
-    Similar to cell_quality_classifier.extract_cell_crop but uses
-    SUPCON_CROP_SIZE (96) instead of the QC classifier's 64.
+    Extract a 128×128 crop of a single cell from multi-channel image data.
 
     Args:
-        image_channels: (C, Y, X) numpy array
+        image_channels: (C, Y, X) numpy array (all channels including mask)
         labeled_mask:   (Y, X) integer array (0=bg, N=cell label)
         cell_label:     which cell to extract
-        phase_channel:  index of the phase contrast channel
+        phase_ch:       index of the phase contrast channel
+        fluor_ch:       index of the ParB fluorescence channel
         pad:            pixels of padding around bounding box
         mask_background: if True, replace background pixels with local mean
                          (keeps the phase halo around the cell edge via dilation)
         dilate_px:      dilation radius in pixels for the background mask
 
     Returns:
-        crop: (2, 96, 96) float32 — [phase, mask], normalised to [0, 1]
+        crop: (3, 128, 128) float32 — [phase, parb, mask], normalised to [0, 1]
         area_px: int — true pixel area of cell in original mask
         None, None if cell_label not found
     """
@@ -179,7 +209,11 @@ def extract_cell_crop_96(image_channels, labeled_mask, cell_label,
     x_max = min(xs.max() + pad + 1, w)
 
     # Phase channel crop
-    phase_crop = image_channels[phase_channel, y_min:y_max,
+    phase_crop = image_channels[phase_ch, y_min:y_max,
+                                x_min:x_max].astype(np.float32)
+
+    # ParB fluorescence channel crop
+    fluor_crop = image_channels[fluor_ch, y_min:y_max,
                                 x_min:x_max].astype(np.float32)
 
     # Binary mask for this cell only
@@ -189,26 +223,28 @@ def extract_cell_crop_96(image_channels, labeled_mask, cell_label,
     # keeping a dilated halo to preserve the phase-contrast edge
     if mask_background:
         dilated = binary_dilation(mask_crop, iterations=dilate_px)
-        bg_val = np.median(phase_crop[~dilated]) if (~dilated).any() else 0.0
-        phase_crop = np.where(dilated, phase_crop, bg_val)
+        bg_phase = np.median(phase_crop[~dilated]) if (~dilated).any() else 0.0
+        bg_fluor = np.median(fluor_crop[~dilated]) if (~dilated).any() else 0.0
+        phase_crop = np.where(dilated, phase_crop, bg_phase)
+        fluor_crop = np.where(dilated, fluor_crop, bg_fluor)
 
     mask_crop = mask_crop.astype(np.float32)
 
-    # Stack: (2, h_crop, w_crop)
-    combined = np.stack([phase_crop, mask_crop], axis=0)
+    # Stack: (3, h_crop, w_crop)
+    combined = np.stack([phase_crop, fluor_crop, mask_crop], axis=0)
 
     # Pad to square
     _, ch, cw = combined.shape
     side = max(ch, cw)
-    padded = np.zeros((2, side, side), dtype=np.float32)
+    padded = np.zeros((3, side, side), dtype=np.float32)
     y_off = (side - ch) // 2
     x_off = (side - cw) // 2
     padded[:, y_off:y_off + ch, x_off:x_off + cw] = combined
 
-    # Resize to SUPCON_CROP_SIZE × SUPCON_CROP_SIZE
-    resized = np.zeros((2, SUPCON_CROP_SIZE, SUPCON_CROP_SIZE), dtype=np.float32)
-    for c in range(2):
-        resized[c] = resize(padded[c], (SUPCON_CROP_SIZE, SUPCON_CROP_SIZE),
+    # Resize to CROP_SIZE × CROP_SIZE
+    resized = np.zeros((3, CROP_SIZE, CROP_SIZE), dtype=np.float32)
+    for c in range(3):
+        resized[c] = resize(padded[c], (CROP_SIZE, CROP_SIZE),
                             order=1, preserve_range=True, anti_aliasing=True)
 
     # Normalise phase channel to [0, 1]
@@ -218,8 +254,15 @@ def extract_cell_crop_96(image_channels, labeled_mask, cell_label,
     else:
         resized[0] = 0.0
 
+    # Normalise fluorescence channel to [0, 1]
+    fmin, fmax = resized[1].min(), resized[1].max()
+    if fmax > fmin:
+        resized[1] = (resized[1] - fmin) / (fmax - fmin)
+    else:
+        resized[1] = 0.0
+
     # Re-threshold mask after resize
-    resized[1] = (resized[1] > 0.5).astype(np.float32)
+    resized[2] = (resized[2] > 0.5).astype(np.float32)
 
     area_px = int(cell_pixels.sum())
     return resized, area_px
@@ -229,7 +272,7 @@ def extract_cell_crop_96(image_channels, labeled_mask, cell_label,
 
 def _process_fov(args):
     """Process a single FOV — designed for use with multiprocessing.Pool."""
-    fov_data, fov_idx, mask_ch, phase_ch, condition_meta, tiff_name = args
+    fov_data, fov_idx, mask_ch, phase_ch, fluor_ch, condition_meta, tiff_name = args
 
     # Convert binary mask → labeled mask via connected components
     binary_mask = fov_data[mask_ch] > 0
@@ -244,9 +287,9 @@ def _process_fov(args):
     cell_labels = set(np.unique(labeled_mask)) - {0}
 
     for cell_label in sorted(cell_labels):
-        crop, area_px = extract_cell_crop_96(
-            fov_data[:mask_ch], labeled_mask, cell_label,
-            phase_channel=phase_ch,
+        crop, area_px = extract_cell_crop(
+            fov_data, labeled_mask, cell_label,
+            phase_ch=phase_ch, fluor_ch=fluor_ch,
         )
         if crop is None:
             continue
@@ -254,9 +297,11 @@ def _process_fov(args):
         crops.append(crop)
         metadata.append({
             "condition_label": condition_meta["condition_label"],
-            "experiment_type": condition_meta["experiment_type"],
-            "reporter": condition_meta["reporter"],
-            "knockdown": condition_meta["knockdown"],
+            "condition_type": condition_meta["condition_type"],
+            "gene": condition_meta["gene"],
+            "drug": condition_meta["drug"],
+            "concentration": condition_meta["concentration"],
+            "replica": condition_meta["replica"],
             "tiff_file": tiff_name,
             "fov_index": fov_idx,
             "cell_label": int(cell_label),
@@ -270,18 +315,13 @@ def _process_fov(args):
 
 def process_single_tiff(tiff_path, condition_meta, n_workers=None):
     """
-    Load a segmented TIFF and extract 96×96 crops for all cells.
+    Load a segmented TIFF and extract 128×128 crops for all cells.
 
     The masks are already quality-filtered from the segmentation pipeline,
     so no additional QC is applied here. FOVs are processed in parallel.
 
-    Args:
-        tiff_path:      Path to the segmented TIFF
-        condition_meta: dict from parse_condition_from_filename
-        n_workers:      number of parallel workers (None = cpu_count)
-
     Returns:
-        crops:    list of (2, 96, 96) float32 arrays
+        crops:    list of (3, 128, 128) float32 arrays
         metadata: list of dicts with per-cell info
         stats:    dict with processing statistics
     """
@@ -293,23 +333,30 @@ def process_single_tiff(tiff_path, condition_meta, n_workers=None):
     # Mask is always the last channel
     mask_ch = n_ch - 1
 
-    # Auto-detect phase channel among the non-mask channels.
+    # Identify phase and fluorescence channels among non-mask channels.
     # Phase contrast has a bright background (high median); fluorescence is
     # mostly dark with sparse bright spots (low median).
     candidate_chs = [c for c in range(n_ch) if c != mask_ch]
-    if len(candidate_chs) == 1:
-        phase_ch = candidate_chs[0]
-    else:
+    if len(candidate_chs) == 2:
         medians = {c: np.median(data[:, c]) for c in candidate_chs}
         phase_ch = max(medians, key=medians.get)
-    print(f"    Phase channel: {phase_ch}  (of {n_ch} channels)")
+        fluor_ch = min(medians, key=medians.get)
+    elif len(candidate_chs) == 1:
+        phase_ch = candidate_chs[0]
+        fluor_ch = candidate_chs[0]  # fallback: duplicate phase as fluor
+        print("  WARNING: only 1 non-mask channel found, using it for both phase and fluorescence")
+    else:
+        raise ValueError(f"Expected 2 non-mask channels, got {len(candidate_chs)}")
+
+    print(f"    Phase channel: {phase_ch}, Fluorescence channel: {fluor_ch}  "
+          f"(of {n_ch} channels)")
 
     if n_workers is None:
         n_workers = min(cpu_count(), n_fov)
 
     # Build args for each FOV
     fov_args = [
-        (data[fov_idx], fov_idx, mask_ch, phase_ch,
+        (data[fov_idx], fov_idx, mask_ch, phase_ch, fluor_ch,
          condition_meta, tiff_path.name)
         for fov_idx in range(n_fov)
     ]
@@ -332,33 +379,20 @@ def process_single_tiff(tiff_path, condition_meta, n_workers=None):
             metadata.extend(fov_meta)
             total_cells += n_cells
 
+    del data  # free TIFF memory immediately
+
     stats = {"n_fov": n_fov, "total_cells": total_cells}
     return crops, metadata, stats
 
 
 # ── HDF5 storage ────────────────────────────────────────────────────────────
 
-def save_to_hdf5(all_crops, all_metadata, output_path):
+def _write_metadata_to_h5(h5_file, all_metadata, n):
     """
-    Save all crops and metadata to a single HDF5 file.
-
-    Datasets:
-        crops:            (N, 2, 96, 96) float32 — gzip compressed
-        condition_labels: (N,) string
-        reporters:        (N,) string
-        experiment_types: (N,) string
-        knockdowns:       (N,) string
-        tiff_files:       (N,) string
-        fov_ids:          (N,) int32 — globally unique FOV identifier
-        is_control:       (N,) bool
-        is_drug:          (N,) bool
-        areas_px:         (N,) int32
+    Write metadata datasets and attributes to an already-open HDF5 file.
+    The 'crops' dataset must already exist and be populated.
     """
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    n = len(all_crops)
-    print(f"\nSaving {n:,} crops to {output_path} ...")
+    print(f"\nWriting metadata for {n:,} cells ...")
 
     # Build globally unique FOV IDs
     fov_key_to_id = {}
@@ -369,57 +403,46 @@ def save_to_hdf5(all_crops, all_metadata, output_path):
             fov_key_to_id[key] = len(fov_key_to_id)
         fov_ids[i] = fov_key_to_id[key]
 
-    # String arrays
     str_dt = h5py.string_dtype()
 
-    with h5py.File(str(output_path), "w") as f:
-        # Crops — chunked and compressed
-        crops_ds = f.create_dataset(
-            "crops", shape=(n, 2, SUPCON_CROP_SIZE, SUPCON_CROP_SIZE),
-            dtype=np.float32,
-            chunks=(min(256, n), 2, SUPCON_CROP_SIZE, SUPCON_CROP_SIZE),
-            compression="gzip", compression_opts=4,
-        )
-        # Write in batches to avoid materialising the full array
-        batch_size = 1000
-        for start in range(0, n, batch_size):
-            end = min(start + batch_size, n)
-            crops_ds[start:end] = np.stack(all_crops[start:end], axis=0)
+    h5_file.create_dataset("condition_labels",
+                           data=[m["condition_label"] for m in all_metadata],
+                           dtype=str_dt)
+    h5_file.create_dataset("condition_types",
+                           data=[m["condition_type"] for m in all_metadata],
+                           dtype=str_dt)
+    h5_file.create_dataset("genes",
+                           data=[m["gene"] for m in all_metadata],
+                           dtype=str_dt)
+    h5_file.create_dataset("drugs",
+                           data=[m["drug"] for m in all_metadata],
+                           dtype=str_dt)
+    h5_file.create_dataset("concentrations",
+                           data=[m["concentration"] for m in all_metadata],
+                           dtype=str_dt)
+    h5_file.create_dataset("replicas",
+                           data=[m["replica"] for m in all_metadata],
+                           dtype=str_dt)
+    h5_file.create_dataset("tiff_files",
+                           data=[m["tiff_file"] for m in all_metadata],
+                           dtype=str_dt)
+    h5_file.create_dataset("fov_ids", data=fov_ids)
+    h5_file.create_dataset("is_control",
+                           data=[m["is_control"] for m in all_metadata],
+                           dtype=bool)
+    h5_file.create_dataset("is_drug",
+                           data=[m["is_drug"] for m in all_metadata],
+                           dtype=bool)
+    h5_file.create_dataset("areas_px",
+                           data=[m["area_px"] for m in all_metadata],
+                           dtype=np.int32)
 
-        f.create_dataset("condition_labels",
-                         data=[m["condition_label"] for m in all_metadata],
-                         dtype=str_dt)
-        f.create_dataset("reporters",
-                         data=[m["reporter"] for m in all_metadata],
-                         dtype=str_dt)
-        f.create_dataset("experiment_types",
-                         data=[m["experiment_type"] for m in all_metadata],
-                         dtype=str_dt)
-        f.create_dataset("knockdowns",
-                         data=[m["knockdown"] for m in all_metadata],
-                         dtype=str_dt)
-        f.create_dataset("tiff_files",
-                         data=[m["tiff_file"] for m in all_metadata],
-                         dtype=str_dt)
-        f.create_dataset("fov_ids", data=fov_ids)
-        f.create_dataset("is_control",
-                         data=[m["is_control"] for m in all_metadata],
-                         dtype=bool)
-        f.create_dataset("is_drug",
-                         data=[m["is_drug"] for m in all_metadata],
-                         dtype=bool)
-        f.create_dataset("areas_px",
-                         data=[m["area_px"] for m in all_metadata],
-                         dtype=np.int32)
-
-        # Attributes
-        f.attrs["crop_size"] = SUPCON_CROP_SIZE
-        f.attrs["n_channels"] = 2
-        f.attrs["channel_names"] = ["phase", "mask"]
-        f.attrs["total_cells"] = n
-        f.attrs["n_fovs"] = len(fov_key_to_id)
-
-    print(f"Done. {n:,} crops, {len(fov_key_to_id)} unique FOVs.")
+    # Attributes
+    h5_file.attrs["crop_size"] = CROP_SIZE
+    h5_file.attrs["n_channels"] = N_CHANNELS
+    h5_file.attrs["channel_names"] = ["phase", "parb", "mask"]
+    h5_file.attrs["total_cells"] = n
+    h5_file.attrs["n_fovs"] = len(fov_key_to_id)
 
 
 # ── Summary ─────────────────────────────────────────────────────────────────
@@ -440,19 +463,19 @@ def print_summary(all_metadata):
     print("-" * 60)
 
     for cl in sorted(counts, key=lambda x: (-counts[x])):
-        ctype = "control" if ctrl_flags[cl] else ("drug" if drug_flags[cl] else "gene")
+        ctype = "control" if ctrl_flags[cl] else ("drug" if drug_flags[cl] else "mutant")
         print(f"{cl:<20} {ctype:<10} {counts[cl]:>8,}")
 
     print("-" * 60)
     n_ctrl = sum(c for cl, c in counts.items() if ctrl_flags[cl])
     n_drug = sum(c for cl, c in counts.items() if drug_flags[cl])
-    n_gene = sum(c for cl, c in counts.items()
-                 if not ctrl_flags[cl] and not drug_flags[cl])
+    n_mutant = sum(c for cl, c in counts.items()
+                   if not ctrl_flags[cl] and not drug_flags[cl])
     print(f"{'TOTAL':<20} {'':10} {sum(counts.values()):>8,}")
-    print(f"  Controls: {n_ctrl:,}  |  Drugs: {n_drug:,}  |  Genes: {n_gene:,}")
+    print(f"  Controls: {n_ctrl:,}  |  Drugs: {n_drug:,}  |  Mutants: {n_mutant:,}")
     print(f"  Conditions: {len(counts)} "
           f"({sum(1 for v in drug_flags.values() if v)} drugs, "
-          f"{sum(1 for cl in counts if not ctrl_flags[cl] and not drug_flags[cl])} genes, "
+          f"{sum(1 for cl in counts if not ctrl_flags[cl] and not drug_flags[cl])} mutants, "
           f"{sum(1 for v in ctrl_flags.values() if v)} controls)")
 
     # Flag conditions with few cells
@@ -509,33 +532,64 @@ def main():
         print("No TIFFs found. Check tiff_dirs in config_supcon.py.")
         sys.exit(1)
 
-    all_crops = []
     all_metadata = []
     total_cells = 0
 
+    output_path = Path(CONFIG["crop_output_h5"])
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    h5_file = None
+    crops_ds = None
+    n_written = 0
+
+    if not args.dry_run:
+        h5_file = h5py.File(str(output_path), "w")
+        # Resizable dataset — start empty, grow as crops arrive
+        crops_ds = h5_file.create_dataset(
+            "crops",
+            shape=(0, N_CHANNELS, CROP_SIZE, CROP_SIZE),
+            maxshape=(None, N_CHANNELS, CROP_SIZE, CROP_SIZE),
+            dtype=np.float32,
+            chunks=(256, N_CHANNELS, CROP_SIZE, CROP_SIZE),
+            compression="gzip", compression_opts=4,
+        )
+
     t0 = time.time()
 
-    for i, (tiff_path, condition_meta) in enumerate(tiff_files):
-        print(f"\n[{i + 1}/{len(tiff_files)}] {tiff_path.name}")
-        crops, metadata, stats = process_single_tiff(tiff_path, condition_meta,
-                                                       n_workers=args.workers)
-        total_cells += stats["total_cells"]
-        print(f"  FOVs: {stats['n_fov']}  |  Cells: {stats['total_cells']:,}")
+    try:
+        for i, (tiff_path, condition_meta) in enumerate(tiff_files):
+            print(f"\n[{i + 1}/{len(tiff_files)}] {tiff_path.name}")
+            crops, metadata, stats = process_single_tiff(tiff_path, condition_meta,
+                                                           n_workers=args.workers)
+            total_cells += stats["total_cells"]
+            print(f"  FOVs: {stats['n_fov']}  |  Cells: {stats['total_cells']:,}")
 
-        all_crops.extend(crops)
-        all_metadata.extend(metadata)
+            all_metadata.extend(metadata)
 
-    elapsed = time.time() - t0
-    print(f"\n{'=' * 60}")
-    print(f"Processed {len(tiff_files)} TIFFs in {elapsed:.0f}s")
-    print(f"Total cells: {total_cells:,}")
+            # Stream crops to HDF5 immediately, then free memory
+            if crops_ds is not None and crops:
+                batch = np.stack(crops, axis=0)
+                new_size = n_written + len(crops)
+                crops_ds.resize(new_size, axis=0)
+                crops_ds[n_written:new_size] = batch
+                n_written = new_size
+                del batch
+            del crops  # free crop memory
 
-    print_summary(all_metadata)
+        elapsed = time.time() - t0
+        print(f"\n{'=' * 60}")
+        print(f"Processed {len(tiff_files)} TIFFs in {elapsed:.0f}s")
+        print(f"Total cells: {total_cells:,}")
 
-    if not args.dry_run and all_crops:
-        save_to_hdf5(all_crops, all_metadata, CONFIG["crop_output_h5"])
-    elif args.dry_run:
-        print("\n(Dry run — no HDF5 written)")
+        print_summary(all_metadata)
+
+        if h5_file is not None and n_written > 0:
+            _write_metadata_to_h5(h5_file, all_metadata, n_written)
+            print(f"\nDone. {n_written:,} crops saved to {output_path}")
+        elif args.dry_run:
+            print("\n(Dry run — no HDF5 written)")
+    finally:
+        if h5_file is not None:
+            h5_file.close()
 
 
 if __name__ == "__main__":

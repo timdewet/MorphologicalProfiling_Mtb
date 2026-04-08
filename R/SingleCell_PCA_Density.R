@@ -13,40 +13,27 @@ suppressPackageStartupMessages({
   library(destiny)    # diffusion map
 })
 
-if (file.exists("Theme.R")) source("Theme.R")
+if (file.exists("R/Theme.R")) source("R/Theme.R")
 
 set.seed(10)
 
 # ----------------------------- configuration ----------------------------------
 
 input_files <- c(
-  "input_data/data_extraction_18_03_25.csv",
-  "input_data/all_morphology_combined.csv"
+  "input_data/smeg_morphology_data.csv"  # TODO: update with actual filename
 )
 
-name_separator <- "__"
+control_labels <- c("Plasmid")  # empty vector controls
 
-control_labels <- c("NT", "No_drug")
-
-# Helper: match control labels including numbered replicates (NT_1, NT_2, ...)
+# Helper: match control labels including numbered replicates
 is_control_label <- function(x) {
   patt <- paste0("^(", paste(control_labels, collapse = "|"), ")(_.+)?$")
   str_detect(x, patt)
 }
 
-exclude_reporters <- c("cydA")
-
-name_corrections <- list(
-  list(experiment = "WT_Reporters_+_drug__imiB__Inn",     reporter = "iniB", knockdown = "INH"),
-  list(experiment = "WT_Reporters_+_drug__imiB__EMB",     reporter = "iniB"),
-  list(experiment = "WT_Reporters_+_drug__imiB__No_drug", reporter = "iniB"),
-  list(experiment = "WT_Reporters_+_drug__imiB__RIF",     reporter = "iniB"),
-  list(experiment = "ATC_Strains__recA__dnaW2",           knockdown = "dnaN1_2")
-)
-
-replicate_groups <- list(
-  dnaN = c("ATC_Strains__recA__dnaN1", "ATC_Strains__recA__dnaW2")
-)
+exclude_reporters <- c()
+name_corrections <- list()
+replicate_groups <- list()
 merge_replicates <- TRUE
 
 drug_experiment_pattern <- "drug"
@@ -112,14 +99,29 @@ if (!dir.exists(fig_dir)) dir.create(fig_dir, recursive = TRUE)
 
 # ----------------------------- helpers ----------------------------------------
 
-parse_sample_name <- function(name, sep = "__") {
-  parts <- str_split_fixed(name, fixed(sep), n = 3)
-  tibble(
-    EXPERIMENT      = name,
-    experiment_type = parts[, 1],
-    reporter        = parts[, 2],
-    knockdown       = parts[, 3]
-  )
+parse_sample_name <- function(name, sep = NULL) {
+  stripped <- str_replace(name, "^Labelled__Drugs__", "")
+  stripped <- str_replace(stripped, "^Labelled__", "")
+
+  ctrl_match   <- str_match(stripped, "^(Plasmid)_R(\\d+)$")
+  mutant_match <- str_match(stripped, "^(MSMEG_\\d+)_R(\\d+)$")
+  drug_match   <- str_match(stripped, "^([A-Z][A-Z0-9]{1,4})_(\\d+X)_R(\\d+)$")
+
+  if (!is.na(ctrl_match[1, 1])) {
+    tibble(EXPERIMENT = name, experiment_type = "control",
+           reporter = "", knockdown = "Plasmid")
+  } else if (!is.na(mutant_match[1, 1])) {
+    tibble(EXPERIMENT = name, experiment_type = "mutant",
+           reporter = "", knockdown = mutant_match[1, 2])
+  } else if (!is.na(drug_match[1, 1])) {
+    tibble(EXPERIMENT = name, experiment_type = "drug",
+           reporter = "",
+           knockdown = paste0(drug_match[1, 2], "_", drug_match[1, 3]))
+  } else {
+    warning("Cannot parse sample name: ", name)
+    tibble(EXPERIMENT = name, experiment_type = NA_character_,
+           reporter = NA_character_, knockdown = NA_character_)
+  }
 }
 
 # Estimate local density at each point using MASS::kde2d
@@ -147,7 +149,7 @@ if (length(missing) > 0) {
   stop("Missing columns: ", paste(missing, collapse = ", "))
 }
 
-meta <- map_dfr(unique(raw$EXPERIMENT), parse_sample_name, sep = name_separator)
+meta <- map_dfr(unique(raw$EXPERIMENT), parse_sample_name)
 
 for (fix in name_corrections) {
   idx <- meta$EXPERIMENT == fix$experiment

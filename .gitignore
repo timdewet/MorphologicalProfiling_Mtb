@@ -1,17 +1,11 @@
 # Data files (too large for git)
-crops/
-embeddings/
-checkpoints/
+output/crops/
+output/embeddings/
+output/checkpoints/
+output/*.csv
 .RData
 input_data/
-
-# Output files (regenerable)
-ot_supcon_distance_matrix.csv
-ot_supcon_ranked_matches.csv
-ot_supcon_pathway_matches.csv
-ot_distance_matrix.csv
-ot_ranked_matches.csv
-sample_crops_*.png
+!input_data/DetailedAll_UpdatedAnnotations.csv
 
 # R project files
 .Rhistory

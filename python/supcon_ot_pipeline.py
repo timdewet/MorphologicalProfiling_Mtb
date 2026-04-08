@@ -2,9 +2,12 @@
 """
 Phase 2: Supervised Contrastive Learning + Optimal Transport Matching
 =====================================================================
-Trains a ResNet-18 backbone with SupCon loss on single-cell phase-contrast
-crops, extracts 512-d embeddings, computes pairwise Wasserstein distances
-between conditions, and runs permutation tests for significance.
+M. smegmatis branch.
+
+Trains a ResNet-18 backbone with SupCon loss on single-cell crops
+(phase + ParB fluorescence + mask), extracts 512-d embeddings, computes
+pairwise Wasserstein distances between conditions, and runs permutation
+tests for significance.
 
 Usage:
     python supcon_ot_pipeline.py                # full pipeline
@@ -98,12 +101,10 @@ class CropHDF5Dataset(Dataset):
         crop = self.crops[idx].copy()  # (2, 96, 96) float32
 
         if self.transform is not None:
-            # Two-view SupCon: generate two differently-augmented views
+            # albumentations expects (H, W, C)
             img = crop.transpose(1, 2, 0)  # (96, 96, 2)
-            view1 = self.transform(image=img)["image"].transpose(2, 0, 1)
-            view2 = self.transform(image=img)["image"].transpose(2, 0, 1)
-            crop = np.stack([view1, view2], axis=0)  # (2, 2, 96, 96)
-            return torch.from_numpy(crop), self.targets[idx]
+            augmented = self.transform(image=img)
+            crop = augmented["image"].transpose(2, 0, 1)  # (2, 96, 96)
 
         return torch.from_numpy(crop), self.targets[idx]
 
@@ -402,18 +403,11 @@ def train_supcon(config):
             valid = targets >= 0
             if valid.sum() < 2:
                 continue
+            crops = crops[valid].to(device)
             targets = targets[valid].to(device)
 
-            # Two-view SupCon: crops is (B, 2, C, H, W)
-            # Unpack views and concatenate along batch dim
-            crops = crops[valid]
-            view1 = crops[:, 0].contiguous().to(device)  # (B, C, H, W)
-            view2 = crops[:, 1].contiguous().to(device)  # (B, C, H, W)
-            all_views = torch.cat([view1, view2], dim=0)  # (2B, C, H, W)
-            all_targets = torch.cat([targets, targets], dim=0)  # (2B,)
-
-            _, projections = model(all_views)
-            loss = criterion(projections, all_targets)
+            _, projections = model(crops)
+            loss = criterion(projections, targets)
 
             optimizer.zero_grad()
             loss.backward()
@@ -565,8 +559,9 @@ def extract_embeddings(config):
                            chunks=(min(1000, len(embeddings)), 512),
                            compression="gzip")
         # Copy metadata from crop H5
-        for key in ["condition_labels", "reporters", "experiment_types",
-                    "knockdowns", "tiff_files", "fov_ids",
+        for key in ["condition_labels", "condition_types", "genes",
+                    "drugs", "concentrations", "replicas",
+                    "tiff_files", "fov_ids",
                     "is_control", "is_drug", "areas_px"]:
             if key in src:
                 dst.create_dataset(key, data=src[key][:])
@@ -676,9 +671,10 @@ def compute_ot_distances(config):
 # ==============================================================================
 
 def rank_matches(dist_df, drug_conditions, gene_conditions, config):
-    """Rank gene knockdowns by ascending distance for each drug,
+    """Rank gene mutants by ascending distance for each drug,
     with pathway annotation if gene_pathway_map.csv is available."""
     gene_to_pathway = load_pathway_map(config) or {}
+    gene_names = load_gene_names(config)
 
     rows = []
     for drug in sorted(drug_conditions):
@@ -688,6 +684,7 @@ def rank_matches(dist_df, drug_conditions, gene_conditions, config):
                 "drug": drug,
                 "rank": rank,
                 "gene": gene,
+                "gene_name": display_label(gene, gene_names),
                 "pathway": gene_to_pathway.get(gene, ""),
                 "distance": dist,
             })
@@ -804,6 +801,36 @@ def permutation_test(config, observed_dist_df, drug_conditions, gene_conditions)
 # ==============================================================================
 # PATHWAY-LEVEL ANALYSIS
 # ==============================================================================
+
+def load_gene_names(config):
+    """Load accession→gene name mapping from annotation CSV.
+
+    Returns dict {accession: gene_name} where unnamed genes ('-') fall
+    back to the accession number.
+    """
+    csv_path = config.get("annotation_csv")
+    if not csv_path or not Path(csv_path).exists():
+        return {}
+    df = pd.read_csv(csv_path, sep=";", usecols=["Accession.no.", "geneName"])
+    mapping = {}
+    for _, row in df.iterrows():
+        acc = str(row["Accession.no."]).strip()
+        gene = str(row["geneName"]).strip()
+        if acc and gene and gene != "-" and gene != "nan":
+            mapping[acc] = gene
+    return mapping
+
+
+def display_label(name, gene_names):
+    """Convert a condition label to a display label using gene names.
+
+    Mutant accessions (MSMEG_XXXX) are replaced with gene names where
+    available. Drug conditions and controls are returned unchanged.
+    """
+    if name in gene_names:
+        return gene_names[name]
+    return name
+
 
 def load_pathway_map(config):
     """Load gene→pathway mapping from CSV. Returns dict {gene: pathway}."""
@@ -990,14 +1017,24 @@ def generate_plots(dist_df, match_table, drug_conditions, gene_conditions,
 
     palette = {"gene": "#4C72B0", "drug": "#DD8452"}
 
+    # Load gene name mapping for display labels
+    gene_names = load_gene_names(config)
+    def dl(name):
+        return display_label(name, gene_names)
+
     # ── 1. Distance heatmap with clustering ──────────────────────────────
     print("Generating distance heatmap ...")
     cond_type = pd.Series("gene", index=dist_df.index)
     cond_type[cond_type.index.isin(drug_conditions)] = "drug"
     row_colors = cond_type.map(palette).rename("type")
 
+    # Use gene names as display labels on the heatmap
+    display_dist_df = dist_df.copy()
+    display_dist_df.index = [dl(c) for c in dist_df.index]
+    display_dist_df.columns = [dl(c) for c in dist_df.columns]
+
     g = sns.clustermap(
-        dist_df, method="ward", cmap="viridis_r",
+        display_dist_df, method="ward", cmap="viridis_r",
         figsize=(12, 10),
         row_colors=row_colors, col_colors=row_colors,
         linewidths=0, xticklabels=True, yticklabels=True,
@@ -1008,7 +1045,7 @@ def generate_plots(dist_df, match_table, drug_conditions, gene_conditions,
     g.ax_heatmap.set_ylabel("")
     g.ax_heatmap.tick_params(labelsize=8)
     from matplotlib.patches import Patch
-    legend_elements = [Patch(facecolor=palette["gene"], label="Gene KD"),
+    legend_elements = [Patch(facecolor=palette["gene"], label="Mutant"),
                        Patch(facecolor=palette["drug"], label="Drug")]
     g.ax_heatmap.legend(handles=legend_elements, loc="upper left",
                         bbox_to_anchor=(1.02, 1), frameon=False, fontsize=9)
@@ -1071,10 +1108,10 @@ def generate_plots(dist_df, match_table, drug_conditions, gene_conditions,
         mask = cond_type == ctype
         ax.scatter(cond_umap[mask, 0], cond_umap[mask, 1],
                    c=color, s=80,
-                   label="Gene KD" if ctype == "gene" else "Drug",
+                   label="Mutant" if ctype == "gene" else "Drug",
                    edgecolors="white", linewidth=0.5, zorder=3)
     for i, label in enumerate(dist_df.index):
-        ax.annotate(label, (cond_umap[i, 0], cond_umap[i, 1]),
+        ax.annotate(dl(label), (cond_umap[i, 0], cond_umap[i, 1]),
                     fontsize=7, ha="center", va="bottom",
                     xytext=(0, 5), textcoords="offset points")
     ax.legend(frameon=False)
@@ -1083,6 +1120,79 @@ def generate_plots(dist_df, match_table, drug_conditions, gene_conditions,
     ax.set_title("Condition-level UMAP (SupCon + Wasserstein)")
     sns.despine(ax=ax)
     fig.savefig(fig_dir / "supcon_umap_conditions.png", dpi=dpi,
+                bbox_inches="tight")
+    plt.close()
+
+    # ── 3b. Condition UMAP with drug–gene edges ────────────────────────
+    print("Generating condition UMAP with edges ...")
+    umap_top_k = 3  # draw edges to top-k gene matches per drug
+
+    # Lookup: condition name → UMAP coordinates
+    cond_xy = {cond: (cond_umap[i, 0], cond_umap[i, 1])
+               for i, cond in enumerate(dist_df.index)}
+
+    # Get distance range for alpha scaling
+    top_edges = match_table[match_table["rank"] <= umap_top_k].copy()
+    d_min = top_edges["distance"].min()
+    d_max = top_edges["distance"].max()
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+
+    # Draw edges first (lower zorder)
+    for _, row in top_edges.iterrows():
+        drug, gene = row["drug"], row["gene"]
+        if drug not in cond_xy or gene not in cond_xy:
+            continue
+        x_d, y_d = cond_xy[drug]
+        x_g, y_g = cond_xy[gene]
+
+        # Alpha: closer = more opaque
+        if d_max > d_min:
+            alpha = 1.0 - (row["distance"] - d_min) / (d_max - d_min)
+            alpha = max(0.15, min(0.9, alpha))
+        else:
+            alpha = 0.5
+
+        # Color: green if significant, grey otherwise
+        is_sig = row.get("significant", False)
+        if pd.isna(is_sig) or is_sig == "False":
+            is_sig = False
+        else:
+            is_sig = bool(is_sig)
+        color = "#55A868" if is_sig else "#999999"
+
+        # Width: rank 1 thicker; significant edges always bold
+        lw = 3.0 if is_sig else (2.5 if row["rank"] == 1 else 1.5)
+        edge_alpha = max(alpha, 0.8) if is_sig else alpha
+
+        ax.plot([x_d, x_g], [y_d, y_g], color=color, alpha=edge_alpha,
+                linewidth=lw, zorder=2 if is_sig else 1)
+
+    # Scatter points on top
+    for ctype, color in palette.items():
+        mask = cond_type == ctype
+        ax.scatter(cond_umap[mask, 0], cond_umap[mask, 1],
+                   c=color, s=80,
+                   label="Mutant" if ctype == "gene" else "Drug",
+                   edgecolors="white", linewidth=0.5, zorder=3)
+    for i, label in enumerate(dist_df.index):
+        ax.annotate(dl(label), (cond_umap[i, 0], cond_umap[i, 1]),
+                    fontsize=7, ha="center", va="bottom",
+                    xytext=(0, 5), textcoords="offset points", zorder=4)
+
+    # Legend
+    from matplotlib.lines import Line2D
+    legend_elements = [
+        Line2D([0], [0], color="#55A868", lw=2.5, label="Significant (FDR < 0.05)"),
+        Line2D([0], [0], color="#999999", lw=1.5, alpha=0.5,
+               label="Not significant"),
+    ]
+    ax.legend(handles=legend_elements, frameon=False, loc="upper left")
+    ax.set_xlabel("UMAP 1")
+    ax.set_ylabel("UMAP 2")
+    ax.set_title("Drug–gene matches (top 3, SupCon + Wasserstein)")
+    sns.despine(ax=ax)
+    fig.savefig(fig_dir / "supcon_umap_conditions_edges.png", dpi=dpi,
                 bbox_inches="tight")
     plt.close()
 

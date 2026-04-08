@@ -21,67 +21,43 @@ suppressPackageStartupMessages({
 })
 
 # Optional: custom theme (only if present)
-if (file.exists("Scripts/Theme.R")) source("Scripts/Theme.R")
+if (file.exists("R/Theme.R")) source("R/Theme.R")
 
 set.seed(10)
 
 # ----------------------------- configuration ----------------------------------
 
 input_files <- c(
-  "input_data/data_extraction_18_03_25.csv",
-  "input_data/all_morphology_combined.csv"
+  "input_data/smeg_morphology_data.csv"  # TODO: update with actual filename
 )
 
-# Sample name format: ExperimentType__Reporter__Knockdown
-# e.g. ATC_Strains__cydA__menH, WT_Reporters_+_drug__cydA__BDQ
-name_separator <- "__"
+# M. smegmatis sample name formats:
+#   Mutants: MSMEG_XXXX_RY  (accession + replica)
+#   Drugs:   ZZZ_AX_RY      (drug code + concentration + replica)
 
-# Which values in the knockdown field identify untreated/control samples?
-# These are used to compute S-score baselines
-control_labels <- c("NT", "No_drug")
+control_labels <- c("Plasmid")  # empty vector controls
 
-# Helper: match control labels including numbered replicates (NT_1, NT_2, ...)
+# Helper: match control labels including numbered replicates
 is_control_label <- function(x) {
   patt <- paste0("^(", paste(control_labels, collapse = "|"), ")(_.+)?$")
   str_detect(x, patt)
 }
 
-# Reporter backgrounds to exclude from analysis (empty vector = include all)
-# e.g. c("cydA") to drop all samples with the cydA reporter background
-exclude_reporters <- c("cydA")
+exclude_reporters <- c()
+name_corrections <- list()
 
-# --- Sample name corrections ---
-# Applied to parsed metadata AFTER parsing but BEFORE analysis.
-# Each entry: list(experiment = "original_name", field = "corrected_value", ...)
-# Supported fields: experiment_type, reporter, knockdown
-name_corrections <- list(
-  list(experiment = "WT_Reporters_+_drug__imiB__Inn", reporter = "iniB", knockdown = "INH"),
-  list(experiment = "ATC_Strains__recA__dnaW2",       knockdown = "dnaN1_rep2")
-)
-
-# --- Replicate groups ---
-# Define which experiments are replicates of the same biological condition.
-# Each entry: canonical_name = c("experiment1", "experiment2", ...)
-# When merge_replicates = TRUE, cells are pooled into one sample per group.
-# When FALSE, replicates stay separate but are labelled _rep1, _rep2, etc.
-replicate_groups <- list(
-  dnaN = c("ATC_Strains__recA__dnaN1", "ATC_Strains__recA__dnaW2")
-)
+replicate_groups <- list()
 merge_replicates <- FALSE
 
-# Include control samples in the analysis? If FALSE, controls are used for
-# S-score baseline only and excluded from PCA/clustering
 include_controls_in_analysis <- TRUE
 
-# Include reporter fluorescence (INTENSITY.ch1.mean) as an additional feature?
-# When TRUE, a per-reporter normalised fluorescence S-score is added to the
-# feature matrix. Normalisation uses the control for the SAME reporter background.
 include_fluorescence <- FALSE
 fluorescence_col     <- "INTENSITY.ch1.mean"
 
-# Which experiment_type values identify drug-treated samples?
-# Samples matching this pattern are separated from knockdown samples
-drug_experiment_pattern <- "drug"   # matched with str_detect (case-insensitive)
+drug_experiment_pattern <- "drug"
+
+# Gene name annotation
+annotation_file <- "input_data/DetailedAll_UpdatedAnnotations.csv"
 
 variables_of_interest <- c(
   "SHAPE.angularity",
@@ -164,16 +140,29 @@ require_cols <- function(df, cols, df_name = deparse(substitute(df))) {
   }
 }
 
-# Parse sample names into components
-# Expected format: ExperimentType__Reporter__Knockdown
-parse_sample_name <- function(name, sep = "__") {
-  parts <- str_split_fixed(name, fixed(sep), n = 3)
-  tibble(
-    EXPERIMENT      = name,
-    experiment_type = parts[, 1],
-    reporter        = parts[, 2],
-    knockdown       = parts[, 3]
-  )
+parse_sample_name <- function(name, sep = NULL) {
+  stripped <- str_replace(name, "^Labelled__Drugs__", "")
+  stripped <- str_replace(stripped, "^Labelled__", "")
+
+  ctrl_match   <- str_match(stripped, "^(Plasmid)_R(\\d+)$")
+  mutant_match <- str_match(stripped, "^(MSMEG_\\d+)_R(\\d+)$")
+  drug_match   <- str_match(stripped, "^([A-Z][A-Z0-9]{1,4})_(\\d+X)_R(\\d+)$")
+
+  if (!is.na(ctrl_match[1, 1])) {
+    tibble(EXPERIMENT = name, experiment_type = "control",
+           reporter = "", knockdown = "Plasmid")
+  } else if (!is.na(mutant_match[1, 1])) {
+    tibble(EXPERIMENT = name, experiment_type = "mutant",
+           reporter = "", knockdown = mutant_match[1, 2])
+  } else if (!is.na(drug_match[1, 1])) {
+    tibble(EXPERIMENT = name, experiment_type = "drug",
+           reporter = "",
+           knockdown = paste0(drug_match[1, 2], "_", drug_match[1, 3]))
+  } else {
+    warning("Cannot parse sample name: ", name)
+    tibble(EXPERIMENT = name, experiment_type = NA_character_,
+           reporter = NA_character_, knockdown = NA_character_)
+  }
 }
 
 # Compute S-scores for mean and CV vs control samples:
@@ -515,7 +504,7 @@ cell_data <- bind_rows(lapply(input_files, readr::read_csv, show_col_types = FAL
 sample_info <- cell_data %>%
   distinct(EXPERIMENT) %>%
   pull(EXPERIMENT) %>%
-  map_dfr(~ parse_sample_name(.x, sep = name_separator))
+  map_dfr(~ parse_sample_name(.x))
 
 # Apply name corrections
 if (length(name_corrections) > 0) {
@@ -539,7 +528,7 @@ if (length(name_corrections) > 0) {
   # Rebuild EXPERIMENT names from corrected components and propagate to cell_data
   sample_info <- sample_info %>%
     mutate(EXPERIMENT_new = paste(experiment_type, reporter, knockdown,
-                                  sep = name_separator))
+                                  sep = "_"))
   correction_map <- sample_info %>%
     filter(EXPERIMENT != EXPERIMENT_new) %>%
     dplyr::select(EXPERIMENT, EXPERIMENT_new)
@@ -569,7 +558,7 @@ if (length(replicate_groups) > 0) {
     exp_type <- group_info$experiment_type[1]
     reporters <- sort(unique(group_info$reporter))
     reporter_str <- paste(reporters, collapse = "+")
-    canonical_name <- paste(exp_type, reporter_str, group_name, sep = name_separator)
+    canonical_name <- paste(exp_type, reporter_str, group_name, sep = "_")
 
     for (i in seq_along(exps)) {
       rep_lookup <- bind_rows(rep_lookup, tibble(
@@ -592,7 +581,7 @@ if (length(replicate_groups) > 0) {
     sample_info <- cell_data %>%
       distinct(EXPERIMENT) %>%
       pull(EXPERIMENT) %>%
-      map_dfr(~ parse_sample_name(.x, sep = name_separator))
+      map_dfr(~ parse_sample_name(.x))
     message(sprintf("Merged %d replicate group(s) into single samples",
                     length(replicate_groups)))
   } else {
@@ -615,6 +604,24 @@ cell_data <- cell_data %>%
     is_drug    = str_detect(experiment_type,
                             regex(drug_experiment_pattern, ignore_case = TRUE))
   )
+
+# Load gene name annotations
+if (file.exists(annotation_file)) {
+  ann <- read_delim(annotation_file, delim = ";", show_col_types = FALSE,
+                    col_select = c("Accession.no.", "geneName"))
+  gene_name_map <- ann %>%
+    filter(geneName != "-", !is.na(geneName)) %>%
+    distinct(`Accession.no.`, .keep_all = TRUE) %>%
+    {setNames(.$geneName, .$`Accession.no.`)}
+  cell_data <- cell_data %>%
+    mutate(display_label = if_else(
+      knockdown %in% names(gene_name_map),
+      gene_name_map[knockdown],
+      knockdown
+    ))
+} else {
+  cell_data <- cell_data %>% mutate(display_label = knockdown)
+}
 
 # Print summary of parsed samples
 message("--- Sample summary ---")
