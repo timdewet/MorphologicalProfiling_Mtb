@@ -320,11 +320,6 @@ def process_single_tiff(tiff_path, condition_meta, n_workers=None):
     The masks are already quality-filtered from the segmentation pipeline,
     so no additional QC is applied here. FOVs are processed in parallel.
 
-    Args:
-        tiff_path:      Path to the segmented TIFF
-        condition_meta: dict from parse_condition_from_filename
-        n_workers:      number of parallel workers (None = cpu_count)
-
     Returns:
         crops:    list of (3, 128, 128) float32 arrays
         metadata: list of dicts with per-cell info
@@ -384,35 +379,20 @@ def process_single_tiff(tiff_path, condition_meta, n_workers=None):
             metadata.extend(fov_meta)
             total_cells += n_cells
 
+    del data  # free TIFF memory immediately
+
     stats = {"n_fov": n_fov, "total_cells": total_cells}
     return crops, metadata, stats
 
 
 # ── HDF5 storage ────────────────────────────────────────────────────────────
 
-def save_to_hdf5(all_crops, all_metadata, output_path):
+def _write_metadata_to_h5(h5_file, all_metadata, n):
     """
-    Save all crops and metadata to a single HDF5 file.
-
-    Datasets:
-        crops:            (N, 3, 128, 128) float32 — gzip compressed
-        condition_labels: (N,) string
-        condition_types:  (N,) string  — "mutant" or "drug"
-        genes:            (N,) string  — MSMEG accession (mutants) or ""
-        drugs:            (N,) string  — drug code (drugs) or ""
-        concentrations:   (N,) string  — concentration (drugs) or ""
-        replicas:         (N,) string
-        tiff_files:       (N,) string
-        fov_ids:          (N,) int32 — globally unique FOV identifier
-        is_control:       (N,) bool
-        is_drug:          (N,) bool
-        areas_px:         (N,) int32
+    Write metadata datasets and attributes to an already-open HDF5 file.
+    The 'crops' dataset must already exist and be populated.
     """
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    n = len(all_crops)
-    print(f"\nSaving {n:,} crops to {output_path} ...")
+    print(f"\nWriting metadata for {n:,} cells ...")
 
     # Build globally unique FOV IDs
     fov_key_to_id = {}
@@ -423,63 +403,46 @@ def save_to_hdf5(all_crops, all_metadata, output_path):
             fov_key_to_id[key] = len(fov_key_to_id)
         fov_ids[i] = fov_key_to_id[key]
 
-    # String arrays
     str_dt = h5py.string_dtype()
 
-    with h5py.File(str(output_path), "w") as f:
-        # Crops — chunked and compressed
-        crops_ds = f.create_dataset(
-            "crops", shape=(n, N_CHANNELS, CROP_SIZE, CROP_SIZE),
-            dtype=np.float32,
-            chunks=(min(256, n), N_CHANNELS, CROP_SIZE, CROP_SIZE),
-            compression="gzip", compression_opts=4,
-        )
-        # Write in batches to avoid materialising the full array
-        batch_size = 1000
-        for start in range(0, n, batch_size):
-            end = min(start + batch_size, n)
-            crops_ds[start:end] = np.stack(all_crops[start:end], axis=0)
+    h5_file.create_dataset("condition_labels",
+                           data=[m["condition_label"] for m in all_metadata],
+                           dtype=str_dt)
+    h5_file.create_dataset("condition_types",
+                           data=[m["condition_type"] for m in all_metadata],
+                           dtype=str_dt)
+    h5_file.create_dataset("genes",
+                           data=[m["gene"] for m in all_metadata],
+                           dtype=str_dt)
+    h5_file.create_dataset("drugs",
+                           data=[m["drug"] for m in all_metadata],
+                           dtype=str_dt)
+    h5_file.create_dataset("concentrations",
+                           data=[m["concentration"] for m in all_metadata],
+                           dtype=str_dt)
+    h5_file.create_dataset("replicas",
+                           data=[m["replica"] for m in all_metadata],
+                           dtype=str_dt)
+    h5_file.create_dataset("tiff_files",
+                           data=[m["tiff_file"] for m in all_metadata],
+                           dtype=str_dt)
+    h5_file.create_dataset("fov_ids", data=fov_ids)
+    h5_file.create_dataset("is_control",
+                           data=[m["is_control"] for m in all_metadata],
+                           dtype=bool)
+    h5_file.create_dataset("is_drug",
+                           data=[m["is_drug"] for m in all_metadata],
+                           dtype=bool)
+    h5_file.create_dataset("areas_px",
+                           data=[m["area_px"] for m in all_metadata],
+                           dtype=np.int32)
 
-        f.create_dataset("condition_labels",
-                         data=[m["condition_label"] for m in all_metadata],
-                         dtype=str_dt)
-        f.create_dataset("condition_types",
-                         data=[m["condition_type"] for m in all_metadata],
-                         dtype=str_dt)
-        f.create_dataset("genes",
-                         data=[m["gene"] for m in all_metadata],
-                         dtype=str_dt)
-        f.create_dataset("drugs",
-                         data=[m["drug"] for m in all_metadata],
-                         dtype=str_dt)
-        f.create_dataset("concentrations",
-                         data=[m["concentration"] for m in all_metadata],
-                         dtype=str_dt)
-        f.create_dataset("replicas",
-                         data=[m["replica"] for m in all_metadata],
-                         dtype=str_dt)
-        f.create_dataset("tiff_files",
-                         data=[m["tiff_file"] for m in all_metadata],
-                         dtype=str_dt)
-        f.create_dataset("fov_ids", data=fov_ids)
-        f.create_dataset("is_control",
-                         data=[m["is_control"] for m in all_metadata],
-                         dtype=bool)
-        f.create_dataset("is_drug",
-                         data=[m["is_drug"] for m in all_metadata],
-                         dtype=bool)
-        f.create_dataset("areas_px",
-                         data=[m["area_px"] for m in all_metadata],
-                         dtype=np.int32)
-
-        # Attributes
-        f.attrs["crop_size"] = CROP_SIZE
-        f.attrs["n_channels"] = N_CHANNELS
-        f.attrs["channel_names"] = ["phase", "parb", "mask"]
-        f.attrs["total_cells"] = n
-        f.attrs["n_fovs"] = len(fov_key_to_id)
-
-    print(f"Done. {n:,} crops, {len(fov_key_to_id)} unique FOVs.")
+    # Attributes
+    h5_file.attrs["crop_size"] = CROP_SIZE
+    h5_file.attrs["n_channels"] = N_CHANNELS
+    h5_file.attrs["channel_names"] = ["phase", "parb", "mask"]
+    h5_file.attrs["total_cells"] = n
+    h5_file.attrs["n_fovs"] = len(fov_key_to_id)
 
 
 # ── Summary ─────────────────────────────────────────────────────────────────
@@ -569,33 +532,64 @@ def main():
         print("No TIFFs found. Check tiff_dirs in config_supcon.py.")
         sys.exit(1)
 
-    all_crops = []
     all_metadata = []
     total_cells = 0
 
+    output_path = Path(CONFIG["crop_output_h5"])
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    h5_file = None
+    crops_ds = None
+    n_written = 0
+
+    if not args.dry_run:
+        h5_file = h5py.File(str(output_path), "w")
+        # Resizable dataset — start empty, grow as crops arrive
+        crops_ds = h5_file.create_dataset(
+            "crops",
+            shape=(0, N_CHANNELS, CROP_SIZE, CROP_SIZE),
+            maxshape=(None, N_CHANNELS, CROP_SIZE, CROP_SIZE),
+            dtype=np.float32,
+            chunks=(256, N_CHANNELS, CROP_SIZE, CROP_SIZE),
+            compression="gzip", compression_opts=4,
+        )
+
     t0 = time.time()
 
-    for i, (tiff_path, condition_meta) in enumerate(tiff_files):
-        print(f"\n[{i + 1}/{len(tiff_files)}] {tiff_path.name}")
-        crops, metadata, stats = process_single_tiff(tiff_path, condition_meta,
-                                                       n_workers=args.workers)
-        total_cells += stats["total_cells"]
-        print(f"  FOVs: {stats['n_fov']}  |  Cells: {stats['total_cells']:,}")
+    try:
+        for i, (tiff_path, condition_meta) in enumerate(tiff_files):
+            print(f"\n[{i + 1}/{len(tiff_files)}] {tiff_path.name}")
+            crops, metadata, stats = process_single_tiff(tiff_path, condition_meta,
+                                                           n_workers=args.workers)
+            total_cells += stats["total_cells"]
+            print(f"  FOVs: {stats['n_fov']}  |  Cells: {stats['total_cells']:,}")
 
-        all_crops.extend(crops)
-        all_metadata.extend(metadata)
+            all_metadata.extend(metadata)
 
-    elapsed = time.time() - t0
-    print(f"\n{'=' * 60}")
-    print(f"Processed {len(tiff_files)} TIFFs in {elapsed:.0f}s")
-    print(f"Total cells: {total_cells:,}")
+            # Stream crops to HDF5 immediately, then free memory
+            if crops_ds is not None and crops:
+                batch = np.stack(crops, axis=0)
+                new_size = n_written + len(crops)
+                crops_ds.resize(new_size, axis=0)
+                crops_ds[n_written:new_size] = batch
+                n_written = new_size
+                del batch
+            del crops  # free crop memory
 
-    print_summary(all_metadata)
+        elapsed = time.time() - t0
+        print(f"\n{'=' * 60}")
+        print(f"Processed {len(tiff_files)} TIFFs in {elapsed:.0f}s")
+        print(f"Total cells: {total_cells:,}")
 
-    if not args.dry_run and all_crops:
-        save_to_hdf5(all_crops, all_metadata, CONFIG["crop_output_h5"])
-    elif args.dry_run:
-        print("\n(Dry run — no HDF5 written)")
+        print_summary(all_metadata)
+
+        if h5_file is not None and n_written > 0:
+            _write_metadata_to_h5(h5_file, all_metadata, n_written)
+            print(f"\nDone. {n_written:,} crops saved to {output_path}")
+        elif args.dry_run:
+            print("\n(Dry run — no HDF5 written)")
+    finally:
+        if h5_file is not None:
+            h5_file.close()
 
 
 if __name__ == "__main__":

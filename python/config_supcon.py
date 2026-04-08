@@ -37,7 +37,7 @@ CONFIG = {
     "crop_size": 128,  # larger than Mtb (96) — M. smegmatis cells are bigger
     "crop_pad": 10,    # pixels of padding around bounding box
     "imaging_pipeline_dir": str(_IMAGING_PIPELINE),
-    "crop_output_h5": str(_MORPH_PROFILING / "output" / "crops" / "all_crops.h5"),
+    "crop_output_h5": str(_MORPH_PROFILING / "output_smeg" / "crops" / "all_crops.h5"),
     "min_cells_per_condition": 50,
 
     # ── SupCon training (Phase 2) ────────────────────────────────────────────
@@ -62,7 +62,7 @@ CONFIG = {
     "sinkhorn_reg": 0.05,
     "sinkhorn_max_iter": 1000,
     "subsample_n": 500,
-    "n_permutations": 10000,
+    "n_permutations": 1000,
     "permutation_top_k": 1,
     "permutation_subsample_n": 200,
     "pca_dims": 50,              # PCA reduction before OT (None to skip)
@@ -76,11 +76,11 @@ CONFIG = {
     "gene_pathway_csv": str(_MORPH_PROFILING / "gene_pathway_map.csv"),
 
     # ── Output paths ─────────────────────────────────────────────────────────
-    "checkpoint_dir": str(_MORPH_PROFILING / "output" / "checkpoints"),
-    "embedding_dir": str(_MORPH_PROFILING / "output" / "embeddings"),
-    "fig_dir": str(_MORPH_PROFILING / "figures"),
-    "output_csv": str(_MORPH_PROFILING / "output" / "ot_supcon_ranked_matches.csv"),
-    "pathway_output_csv": str(_MORPH_PROFILING / "output" / "ot_supcon_pathway_matches.csv"),
-    "distance_csv": str(_MORPH_PROFILING / "output" / "ot_supcon_distance_matrix.csv"),
+    "checkpoint_dir": str(_MORPH_PROFILING / "output_smeg" / "checkpoints"),
+    "embedding_dir": str(_MORPH_PROFILING / "output_smeg" / "embeddings"),
+    "fig_dir": str(_MORPH_PROFILING / "figures_smeg"),
+    "output_csv": str(_MORPH_PROFILING / "output_smeg" / "ot_supcon_ranked_matches.csv"),
+    "pathway_output_csv": str(_MORPH_PROFILING / "output_smeg" / "ot_supcon_pathway_matches.csv"),
+    "distance_csv": str(_MORPH_PROFILING / "output_smeg" / "ot_supcon_distance_matrix.csv"),
     "fig_dpi": 300,
 }
