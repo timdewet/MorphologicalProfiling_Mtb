@@ -18,8 +18,10 @@
 # (sin theta, cos theta); checked against bbox extents (r = 0.994).
 #
 # Run from the project root:
-#   Rscript optimisations/dilution_factors/dilution_optimisation.R [features.csv]
+#   Rscript optimisations/dilution_factors/dilution_optimisation.R [features.csv] [od.RUC]
 # Outputs (summary CSVs + figures/) are written next to features.csv.
+# If no .RUC is given, the single *.RUC next to features.csv is used (OD600
+# section is skipped when there is none, or more than one).
 # =============================================================================
 
 suppressPackageStartupMessages({
@@ -40,6 +42,14 @@ in_file <- if (length(args)) args[1] else "optimisations/dilution_factors/all_fe
 out_dir <- dirname(normalizePath(in_file, mustWork = TRUE))
 fig_dir <- file.path(out_dir, "figures")
 dir.create(fig_dir, showWarnings = FALSE, recursive = TRUE)
+
+ruc_file <- if (length(args) >= 2) args[2] else
+  list.files(out_dir, pattern = "\\.RUC$", full.names = TRUE)
+if (length(ruc_file) > 1) {
+  message("Several .RUC files found - pass the one to use as the 2nd argument; skipping OD600 section:\n  ",
+          paste(basename(ruc_file), collapse = "\n  "))
+  ruc_file <- character(0)
+}
 
 save_fig <- function(p, name, w, h, dpi = 300) {
   # cairo is unavailable without XQuartz; quartz (pdf) + ragg (png) render µ correctly
@@ -66,6 +76,7 @@ d[, c("drug", "conc") := tstrsplit(dc, "_")]
 d[, dil := as.integer(sub("1in", "", sub("_focused", "", dil)))]
 d[, conc := factor(conc, levels = conc_levels)]
 d[, condition := paste(drug, conc)]
+d[, img_well := sub("^Plate\\d+_([A-H]\\d+)_.*$", "\\1", source_czi)]
 d[, c("dc", "reporter") := NULL]
 px_um <- sqrt(d$area_um2[1] / d$area_px[1])   # 0.0721 um / px
 fov_area_um2 <- (2048 * px_um)^2               # ~21,800 um^2 per FOV
@@ -143,8 +154,8 @@ fv[, `:=`(frac_touch = ifelse(cells > 0, 1 - iso / cells, NA_real_),
 wl <- fv[, .(cells_fov = mean(cells), iso_fov = mean(iso),
              cv_fov = sd(cells) / mean(cells),
              coverage = mean(coverage)), by = .(drug, conc, condition, dil)]
-wl2 <- d[, .(frac_touch = 1 - mean(isolated), frac_suspect = mean(suspect),
-             frac_in_clus3 = mean(cluster_size >= 3)),
+wl2 <- d[, .(img_well = img_well[1], frac_touch = 1 - mean(isolated),
+             frac_suspect = mean(suspect), frac_in_clus3 = mean(cluster_size >= 3)),
          by = .(drug, conc, condition, dil)]
 wl <- merge(wl, wl2, by = c("drug", "conc", "condition", "dil"))
 wl[, dil_f := dil_lab(dil)]
@@ -266,7 +277,6 @@ save_fig(p3, "03_morphology_vs_dilution", 11, 4.2)
 # ---- 4. Decision summary ----------------------------------------------------
 wl[, iso_rel := iso_fov / max(iso_fov), by = condition]
 wl[, best := iso_fov == max(iso_fov), by = condition]
-fwrite(wl, file.path(out_dir, "dilution_summary_per_condition.csv"))
 
 sm <- wl[, .(cells_fov = median(cells_fov), iso_fov = median(iso_fov),
              iso_fov_min = min(iso_fov), iso_fov_max = max(iso_fov),
@@ -323,4 +333,87 @@ p5 <- ggplot(wl, aes(dil_f, conc, fill = iso_fov)) +
         strip.placement = "outside", plot.subtitle = element_text(size = 8))
 save_fig(p5, "05_isolated_cells_heatmap", 6, 7.5)
 
+# ---- 6. Does culture OD600 explain cells per FOV? ---------------------------
+# CLARIOstar .RUC = zip holding an "Absolute Database" file. Each well-channel
+# record contains: 0xE0, well label ("A01".."H12"), ..., wavelength (double,
+# +18 bytes) and reading (double, +26 bytes). Channel 600 nm is the OD; the
+# 900/993 nm channels are pathlength-correction reads and are ignored.
+read_clariostar_od <- function(ruc, wavelength = 600) {
+  tmp <- tempfile(); on.exit(unlink(tmp, recursive = TRUE))
+  utils::unzip(ruc, exdir = tmp)
+  f <- list.files(tmp, pattern = "\\.abs$", full.names = TRUE)
+  b <- readBin(f, "raw", file.info(f)$size)
+  is_row <- b >= as.raw(0x41) & b <= as.raw(0x48)          # "A".."H"
+  is_dig <- b >= as.raw(0x30) & b <= as.raw(0x39)
+  n <- length(b)
+  hit <- which(b[1:(n - 34)] == as.raw(0xE0))
+  hit <- hit[is_row[hit + 1] & is_dig[hit + 2] & is_dig[hit + 3] & b[hit + 4] == as.raw(0)]
+  rd  <- function(at) vapply(at, function(i) readBin(b[i:(i + 7)], "double", 1, 8, endian = "little"), 0)
+  out <- data.table(well  = vapply(hit, function(i) rawToChar(b[(i + 1):(i + 3)]), ""),
+                    wl    = rd(hit + 18),
+                    value = rd(hit + 26))
+  out <- unique(out[wl == wavelength, .(well, value)])
+  stopifnot(nrow(out) == 96, !anyDuplicated(out$well))
+  out[, `:=`(row = substr(well, 1, 1), col = as.integer(substring(well, 2)))]
+  out[]
+}
+
+if (length(ruc_file) && file.exists(ruc_file)) {
+  od <- read_clariostar_od(ruc_file)
+  # Reader block A2-F11 = imaging wells A1-F10 with columns mirrored
+  # (reader A2 -> imaging A10, reader A11 -> imaging A1).
+  od[, img_well := paste0(row, 12L - col)]
+  # Blank = edge wells flanking the imaging block (reader cols 1 and 12, rows A-F)
+  od_blank <- median(od[col %in% c(1, 12) & row %in% LETTERS[1:6], value])
+  od[, od_net := value - od_blank]
+  message(sprintf("OD600 blank (reader cols 1 & 12, rows A-F): %.3f", od_blank))
+
+  wl <- merge(wl, od[, .(img_well, reader_well = well, od600 = value, od_net)],
+              by = "img_well", all.x = TRUE)
+  setorder(wl, drug, conc, dil)
+
+  # Does OD add anything once dilution is accounted for?  (well level, n = 60)
+  fit_od  <- lm(log(cells_fov) ~ log(dil) + od_net, data = wl)
+  fit_odc <- lm(log(cells_fov) ~ log(dil) + od_net + condition, data = wl)
+  co  <- summary(fit_od)$coefficients["od_net", ]
+  coc <- summary(fit_odc)$coefficients["od_net", ]
+  message(sprintf("log(cells/FOV) ~ log(dil) + OD: OD coef %.2f, p = %.2f; within condition p = %.2f",
+                  co[1], co[4], coc[4]))
+  wl[, resid_dil := resid(lm(log(cells_fov) ~ log(dil), data = wl))]
+
+  p6a <- ggplot(wl, aes(dil_f, conc, fill = od_net)) +
+    geom_tile(colour = "white", linewidth = 0.6) +
+    geom_text(aes(label = sprintf("%.2f", od_net)), size = 3) +
+    scale_fill_gradient(low = "#f0f0f0", high = "#7fc97f", name = "Net\nOD600") +
+    facet_wrap(~ drug, ncol = 1, strip.position = "left") +
+    labs(x = "Dilution", y = NULL, title = "Culture OD600",
+         subtitle = sprintf("Blank-subtracted (blank = %.3f); same layout as isolated-cell heatmap",
+                            od_blank)) +
+    theme_Publication(base_size = 11) +
+    theme(legend.position = "right", legend.direction = "vertical",
+          legend.title = element_text(size = 9), axis.line = element_blank(),
+          strip.placement = "outside", plot.subtitle = element_text(size = 8))
+
+  p6b <- ggplot(wl, aes(od_net, exp(resid_dil))) +
+    geom_hline(yintercept = 1, colour = "grey60") +
+    geom_smooth(method = "lm", formula = y ~ x, colour = "black", linewidth = 0.8,
+                se = TRUE, fill = "grey85") +
+    geom_point(aes(colour = drug, shape = conc), size = 2.4, alpha = 0.85) +
+    scale_y_log10() +
+    scale_colour_Publication() +
+    labs(x = "Net OD600", y = "Cells/FOV relative to dilution expectation",
+         title = "OD vs cell yield",
+         subtitle = sprintf("Residual after log(cells) ~ log(dilution). OD effect p = %.2f (p = %.2f within condition)",
+                            co[4], coc[4])) +
+    theme_Publication(base_size = 11) +
+    theme(legend.position = "bottom", legend.direction = "horizontal",
+          legend.box = "vertical", plot.subtitle = element_text(size = 8))
+
+  p6 <- (p6a | p6b) + plot_layout(widths = c(1, 1.15))
+  save_fig(p6, "06_od600_vs_cell_yield", 12, 7.5)
+} else {
+  message("No .RUC plate-reader file found - skipping OD600 section")
+}
+
+fwrite(wl, file.path(out_dir, "dilution_summary_per_condition.csv"))
 message("Done. Figures in ", fig_dir)
