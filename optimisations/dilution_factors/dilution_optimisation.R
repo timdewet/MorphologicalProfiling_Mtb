@@ -36,7 +36,7 @@ if (file.exists("Theme.R")) source("Theme.R") else
   stop("Theme.R not found - run from project root")
 
 args    <- commandArgs(trailingOnly = TRUE)
-in_file <- if (length(args)) args[1] else "optimisations/dilution_factors/all_features_day4.csv"
+in_file <- if (length(args)) args[1] else "optimisations/dilution_factors/all_features_day2.csv"
 
 # All outputs (CSVs + figures/) go next to the input data
 out_dir <- dirname(normalizePath(in_file, mustWork = TRUE))
