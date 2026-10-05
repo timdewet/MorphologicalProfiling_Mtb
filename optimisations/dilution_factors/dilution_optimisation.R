@@ -19,6 +19,7 @@
 #
 # Run from the project root:
 #   Rscript optimisations/dilution_factors/dilution_optimisation.R [features.csv]
+# Outputs (summary CSVs + figures/) are written next to features.csv.
 # =============================================================================
 
 suppressPackageStartupMessages({
@@ -32,12 +33,13 @@ suppressPackageStartupMessages({
 if (file.exists("Theme.R")) source("Theme.R") else
   stop("Theme.R not found - run from project root")
 
-out_dir <- "optimisations/dilution_factors"
+args    <- commandArgs(trailingOnly = TRUE)
+in_file <- if (length(args)) args[1] else "optimisations/dilution_factors/all_features_day4.csv"
+
+# All outputs (CSVs + figures/) go next to the input data
+out_dir <- dirname(normalizePath(in_file, mustWork = TRUE))
 fig_dir <- file.path(out_dir, "figures")
 dir.create(fig_dir, showWarnings = FALSE, recursive = TRUE)
-
-args    <- commandArgs(trailingOnly = TRUE)
-in_file <- if (length(args)) args[1] else file.path(out_dir, "all_features_day4.csv")
 
 save_fig <- function(p, name, w, h, dpi = 300) {
   # cairo is unavailable without XQuartz; quartz (pdf) + ragg (png) render µ correctly
