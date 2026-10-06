@@ -41,7 +41,7 @@
 #   Rscript optimisations/dilution_factors/drug_genetic_neighbours.R \
 #     [drug_features.csv] [library_dir] [library_profiles.csv] [dilutions]
 # dilutions = "all" (default) or a comma list, e.g. "50".
-# Outputs -> <drug_features dir>/drug_neighbours/<all_dilutions | 1in50 ...>/
+# Outputs -> <drug_features dir>/<day tag>/drug_neighbours/<all_dilutions | 1in50 ...>/
 # =============================================================================
 
 suppressPackageStartupMessages({
@@ -63,7 +63,8 @@ ALL_DILUTIONS <- c(20L, 50L, 100L, 150L, 200L)
 DILUTIONS <- if (dil_arg == "all") ALL_DILUTIONS else as.integer(strsplit(dil_arg, ",")[[1]])
 run_tag <- if (dil_arg == "all") "all_dilutions" else paste0("1in", paste(DILUTIONS, collapse = "_"))
 
-out_dir <- file.path(dirname(normalizePath(drug_file, mustWork = TRUE)), "drug_neighbours", run_tag)
+tag <- sub("^all_features_?", "", tools::file_path_sans_ext(basename(drug_file)))
+out_dir <- file.path(dirname(normalizePath(drug_file, mustWork = TRUE)), tag, "drug_neighbours", run_tag)
 fig_dir <- file.path(out_dir, "figures")
 dir.create(fig_dir, showWarnings = FALSE, recursive = TRUE)
 
@@ -397,9 +398,9 @@ print(str_all[, .(cond, anchor, to_NT = round(dist_to_NT / typical_NT_NT, 1),
                   nn_dist = round(nn_distance, 2), rep_spread = round(replicate_spread, 2))])
 
 # ---- figures ----------------------------------------------------------------
-dil_txt <- if (multi_rep) sprintf("dilutions %s pooled as replicate wells",
+dil_txt <- if (multi_rep) sprintf("%s; dilutions %s pooled as replicate wells", tag,
                                   paste0("1:", DILUTIONS, collapse = "/")) else
-  sprintf("1:%s dilution only", paste(DILUTIONS, collapse = "/"))
+  sprintf("%s; 1:%s dilution only", tag, paste(DILUTIONS, collapse = "/"))
 row_levels <- unlist(lapply(c("EMB", "INH", "MOX", "RIF"), function(dg) paste(dg, conc_levels)))
 anchor_labs <- c(libNT = "Library-NT", plate = "Drug-plate")
 
@@ -513,7 +514,8 @@ if (multi_rep) {
     scale_colour_Publication() +
     facet_wrap(~ anchor_lab, scales = "free") +
     labs(title = "Replicate wells vs pooled profiles",
-         subtitle = "Small = individual dilution wells; large = condition mean. PCA of the drug profiles in the library-defined space") +
+         subtitle = "Small = individual dilution wells; large = condition mean. PCA of the drug profiles in the library-defined space",
+         caption = dil_txt) +
     theme_Publication(base_size = 11) +
     theme(legend.position = "bottom", legend.direction = "horizontal",
           plot.subtitle = element_text(size = 8))

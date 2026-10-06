@@ -19,9 +19,11 @@
 #
 # Run from the project root:
 #   Rscript optimisations/dilution_factors/dilution_optimisation.R [features.csv] [od.RUC]
-# Outputs (summary CSVs + figures/) are written next to features.csv.
-# If no .RUC is given, the single *.RUC next to features.csv is used (OD600
-# section is skipped when there is none, or more than one).
+# Outputs (summary CSVs + figures/) go to <features dir>/<tag>/, where tag is
+# the timepoint in the file name (all_features_day4.csv -> day4).
+# If no .RUC is given, the .RUC next to features.csv whose name carries the
+# same day ("day 4") is used; the OD600 section is skipped when there is no
+# unique match.
 # =============================================================================
 
 suppressPackageStartupMessages({
@@ -38,20 +40,27 @@ if (file.exists("Theme.R")) source("Theme.R") else
 args    <- commandArgs(trailingOnly = TRUE)
 in_file <- if (length(args)) args[1] else "optimisations/dilution_factors/all_features_day2.csv"
 
-# All outputs (CSVs + figures/) go next to the input data
-out_dir <- dirname(normalizePath(in_file, mustWork = TRUE))
-fig_dir <- file.path(out_dir, "figures")
+# Outputs go to a per-timepoint folder next to the input data
+data_dir <- dirname(normalizePath(in_file, mustWork = TRUE))
+tag      <- sub("^all_features_?", "", tools::file_path_sans_ext(basename(in_file)))
+out_dir  <- file.path(data_dir, tag)
+fig_dir  <- file.path(out_dir, "figures")
 dir.create(fig_dir, showWarnings = FALSE, recursive = TRUE)
 
-ruc_file <- if (length(args) >= 2) args[2] else
-  list.files(out_dir, pattern = "\\.RUC$", full.names = TRUE)
+ruc_file <- if (length(args) >= 2) args[2] else {
+  day <- sub("^day", "", regmatches(tag, regexpr("day\\d+", tag)))
+  cand <- list.files(data_dir, pattern = "\\.RUC$", full.names = TRUE)
+  if (length(day)) cand[grepl(paste0("day ?", day, "_"), basename(cand))] else cand
+}
 if (length(ruc_file) > 1) {
-  message("Several .RUC files found - pass the one to use as the 2nd argument; skipping OD600 section:\n  ",
+  message("Several .RUC files match - pass the one to use as the 2nd argument; skipping OD600 section:\n  ",
           paste(basename(ruc_file), collapse = "\n  "))
   ruc_file <- character(0)
 }
+message("Timepoint: ", tag, if (length(ruc_file)) paste0(" | OD file: ", basename(ruc_file)) else "")
 
 save_fig <- function(p, name, w, h, dpi = 300) {
+  p <- if (inherits(p, "patchwork")) p + plot_annotation(caption = tag) else p + labs(caption = tag)
   # cairo is unavailable without XQuartz; quartz (pdf) + ragg (png) render µ correctly
   ggsave(file.path(fig_dir, paste0(name, ".pdf")), p, width = w, height = h, bg = "white",
          device = function(filename, ...) grDevices::quartz(type = "pdf", file = filename, ...))
