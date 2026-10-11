@@ -36,6 +36,8 @@ suppressPackageStartupMessages({
 
 if (file.exists("Theme.R")) source("Theme.R") else
   stop("Theme.R not found - run from project root")
+script_dir <- dirname(sub("^--file=", "", grep("^--file=", commandArgs(FALSE), value = TRUE)))
+source(file.path(script_dir, "plate_reader.R"))
 
 args    <- commandArgs(trailingOnly = TRUE)
 in_file <- if (length(args)) args[1] else "optimisations/dilution_factors/all_features_day2.csv"
@@ -47,11 +49,7 @@ out_dir  <- file.path(data_dir, tag)
 fig_dir  <- file.path(out_dir, "figures")
 dir.create(fig_dir, showWarnings = FALSE, recursive = TRUE)
 
-ruc_file <- if (length(args) >= 2) args[2] else {
-  day <- sub("^day", "", regmatches(tag, regexpr("day\\d+", tag)))
-  cand <- list.files(data_dir, pattern = "\\.RUC$", full.names = TRUE)
-  if (length(day)) cand[grepl(paste0("day ?", day, "_"), basename(cand), ignore.case = TRUE)] else cand
-}
+ruc_file <- if (length(args) >= 2) args[2] else find_ruc(data_dir, tag)
 if (length(ruc_file) > 1) {
   message("Several .RUC files match - pass the one to use as the 2nd argument; skipping OD600 section:\n  ",
           paste(basename(ruc_file), collapse = "\n  "))
@@ -343,39 +341,10 @@ p5 <- ggplot(wl, aes(dil_f, conc, fill = iso_fov)) +
 save_fig(p5, "05_isolated_cells_heatmap", 6, 7.5)
 
 # ---- 6. Does culture OD600 explain cells per FOV? ---------------------------
-# CLARIOstar .RUC = zip holding an "Absolute Database" file. Each well-channel
-# record contains: 0xE0, well label ("A01".."H12"), ..., wavelength (double,
-# +18 bytes) and reading (double, +26 bytes). Channel 600 nm is the OD; the
-# 900/993 nm channels are pathlength-correction reads and are ignored.
-read_clariostar_od <- function(ruc, wavelength = 600) {
-  tmp <- tempfile(); on.exit(unlink(tmp, recursive = TRUE))
-  utils::unzip(ruc, exdir = tmp)
-  f <- list.files(tmp, pattern = "\\.abs$", full.names = TRUE)
-  b <- readBin(f, "raw", file.info(f)$size)
-  is_row <- b >= as.raw(0x41) & b <= as.raw(0x48)          # "A".."H"
-  is_dig <- b >= as.raw(0x30) & b <= as.raw(0x39)
-  n <- length(b)
-  hit <- which(b[1:(n - 34)] == as.raw(0xE0))
-  hit <- hit[is_row[hit + 1] & is_dig[hit + 2] & is_dig[hit + 3] & b[hit + 4] == as.raw(0)]
-  rd  <- function(at) vapply(at, function(i) readBin(b[i:(i + 7)], "double", 1, 8, endian = "little"), 0)
-  out <- data.table(well  = vapply(hit, function(i) rawToChar(b[(i + 1):(i + 3)]), ""),
-                    wl    = rd(hit + 18),
-                    value = rd(hit + 26))
-  out <- unique(out[wl == wavelength, .(well, value)])
-  stopifnot(nrow(out) == 96, !anyDuplicated(out$well))
-  out[, `:=`(row = substr(well, 1, 1), col = as.integer(substring(well, 2)))]
-  out[]
-}
-
 if (length(ruc_file) && file.exists(ruc_file)) {
-  od <- read_clariostar_od(ruc_file)
-  # Reader block A2-F11 = imaging wells A1-F10 with columns mirrored
-  # (reader A2 -> imaging A10, reader A11 -> imaging A1).
-  od[, img_well := paste0(row, 12L - col)]
-  # Blank = edge wells flanking the imaging block (reader cols 1 and 12, rows A-F)
-  od_blank <- median(od[col %in% c(1, 12) & row %in% LETTERS[1:6], value])
-  od[, od_net := value - od_blank]
-  message(sprintf("OD600 blank (reader cols 1 & 12, rows A-F): %.3f", od_blank))
+  od <- add_plate_layout(read_clariostar_od(ruc_file))[!is.na(img_well)]
+  od_blank <- od$blank[1]
+  message(sprintf("OD600 blank (reader row %s): %.3f", BLANK_ROW, od_blank))
 
   wl <- merge(wl, od[, .(img_well, reader_well = well, od600 = value, od_net)],
               by = "img_well", all.x = TRUE)
@@ -396,7 +365,7 @@ if (length(ruc_file) && file.exists(ruc_file)) {
     scale_fill_gradient(low = "#f0f0f0", high = "#7fc97f", name = "Net\nOD600") +
     facet_wrap(~ drug, ncol = 1, strip.position = "left") +
     labs(x = "Dilution", y = NULL, title = "Culture OD600",
-         subtitle = sprintf("Blank-subtracted (blank = %.3f); same layout as isolated-cell heatmap",
+         subtitle = sprintf("Blank-subtracted (reader row H = %.3f); same layout as isolated-cell heatmap",
                             od_blank)) +
     theme_Publication(base_size = 11) +
     theme(legend.position = "right", legend.direction = "vertical",
