@@ -22,7 +22,7 @@
 # Outputs (summary CSVs + figures/) go to <features dir>/<tag>/, where tag is
 # the timepoint in the file name (all_features_day4.csv -> day4).
 # If no .RUC is given, the .RUC next to features.csv whose name carries the
-# same day ("day 4") is used; the OD600 section is skipped when there is no
+# same day ("day 4", "Day7"; case-insensitive) is used; the OD600 section is skipped when there is no
 # unique match.
 # =============================================================================
 
@@ -50,7 +50,7 @@ dir.create(fig_dir, showWarnings = FALSE, recursive = TRUE)
 ruc_file <- if (length(args) >= 2) args[2] else {
   day <- sub("^day", "", regmatches(tag, regexpr("day\\d+", tag)))
   cand <- list.files(data_dir, pattern = "\\.RUC$", full.names = TRUE)
-  if (length(day)) cand[grepl(paste0("day ?", day, "_"), basename(cand))] else cand
+  if (length(day)) cand[grepl(paste0("day ?", day, "_"), basename(cand), ignore.case = TRUE)] else cand
 }
 if (length(ruc_file) > 1) {
   message("Several .RUC files match - pass the one to use as the 2nd argument; skipping OD600 section:\n  ",

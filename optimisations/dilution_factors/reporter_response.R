@@ -1,5 +1,5 @@
 # =============================================================================
-# iniB-mScarlet reporter response to drugs (Plate60, day 2 vs day 4)
+# iniB-mScarlet reporter response to drugs across timepoints (Plate60)
 #
 # Reporter readout = per-cell intensity_median_mCher (never intensity_total,
 # which tracks cell area).  Uninduced cells sit on a background floor (~63-69),
@@ -8,15 +8,19 @@
 # No untreated wells on these plates, so "induced" is defined against an
 # internal uninduced reference: MOX- and RIF-treated cells, which stay at
 # background (iniBAC responds to cell-wall stress - INH, EMB - not to RIF).
-# A cell is induced if it is brighter than the 99th percentile of that day's
-# MOX + RIF cells (1% false-positive rate by construction).  Absolute
+# A cell is induced if it is at least ABOVE_FLOOR x the median MOX + RIF cell of
+# that day (i.e. >= 50% above background).  A ratio to the floor is used rather
+# than a reference percentile because the reference can carry a bright tail of
+# its own (day 7: 12-20% bright cells in the 1:150/1:200 MOX/RIF wells only),
+# which would drag a percentile threshold upwards.  The share of reference cells
+# above threshold is reported per day as a false-positive rate.  Absolute
 # intensities are compared between days only descriptively (separate plates).
 #
 # Each drug x dose has 5 wells (the dilution series).  Per-well FOV spread is
 # shown so well-to-well differences can be told apart from imaging noise.
 #
 # Run from the project root:
-#   Rscript optimisations/dilution_factors/reporter_response.R [data_dir] [day2,day4]
+#   Rscript optimisations/dilution_factors/reporter_response.R [data_dir] [day2,day4,...]
 # Outputs -> <data_dir>/reporter/
 # =============================================================================
 
@@ -32,7 +36,12 @@ if (file.exists("Theme.R")) source("Theme.R") else
 
 args     <- commandArgs(trailingOnly = TRUE)
 data_dir <- if (length(args) >= 1) args[1] else "optimisations/dilution_factors"
-days     <- if (length(args) >= 2) strsplit(args[2], ",")[[1]] else c("day2", "day4")
+days     <- if (length(args) >= 2) strsplit(args[2], ",")[[1]] else {
+  # every all_features_dayN.csv in data_dir, in time order
+  f <- list.files(data_dir, "^all_features_day[0-9]+\\.csv$")
+  dd <- sub("^all_features_(day[0-9]+)\\.csv$", "\\1", f)
+  dd[order(as.integer(sub("day", "", dd)))]
+}
 
 out_dir <- file.path(data_dir, "reporter")
 fig_dir <- file.path(out_dir, "figures")
@@ -48,7 +57,7 @@ save_fig <- function(p, name, w, h, dpi = 300) {
 
 REPORTER     <- "intensity_median_mCher"
 REF_DRUGS    <- c("MOX", "RIF")   # uninduced reference
-REF_QUANTILE <- 0.99
+ABOVE_FLOOR  <- 1.5             # induced = >= 1.5 x background floor
 MIN_CELLS    <- 20L              # per class, for within-well induced-vs-not contrasts
 
 conc_levels <- c("0.25xMIC", "0.5xMIC", "1xMIC")
@@ -70,7 +79,9 @@ d[, c("dc", "rep") := NULL]
 
 # ---- induced threshold per day ----------------------------------------------
 thr <- d[drug %in% REF_DRUGS, .(floor = median(reporter),
-                                threshold = quantile(reporter, REF_QUANTILE)), by = day]
+                                threshold = ABOVE_FLOOR * median(reporter),
+                                ref_above = mean(reporter > ABOVE_FLOOR * median(reporter))),
+         by = day]
 d <- merge(d, thr, by = "day")
 d[, induced := reporter > threshold]
 message("Uninduced reference (", paste(REF_DRUGS, collapse = " + "), "), per day:")
@@ -145,8 +156,8 @@ p1 <- ggplot(d, aes(reporter, cond_lab, fill = drug)) +
   facet_wrap(~ day, nrow = 1) +
   labs(x = "iniB-mScarlet, per-cell median intensity (log scale)", y = NULL,
        title = "iniB reporter per cell",
-       subtitle = sprintf("All dilution wells pooled. Dashed = induced threshold (%.0fth percentile of %s cells)",
-                          100 * REF_QUANTILE, paste(REF_DRUGS, collapse = " + "))) +
+       subtitle = sprintf("All dilution wells pooled. Dashed = induced threshold (%.1f x median %s cell)",
+                          ABOVE_FLOOR, paste(REF_DRUGS, collapse = " + "))) +
   theme_Publication(base_size = 11) +
   theme(legend.position = "none", plot.subtitle = element_text(size = 8))
 save_fig(p1, "01_reporter_distributions", 10, 7)

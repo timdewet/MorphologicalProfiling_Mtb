@@ -1,11 +1,11 @@
 # =============================================================================
-# Day 2 vs day 4 of drug exposure (Plate60, iniB-mScarlet): side-by-side
+# Drug-exposure timepoints (Plate60, iniB-mScarlet; e.g. day 2, 4, 7): side-by-side
 # comparison of the per-day outputs of dilution_optimisation.R and
 # drug_genetic_neighbours.R (all dilutions pooled as replicate wells).
 #
 # Reads <data_dir>/<day>/... for each day; writes <data_dir>/day_comparison/.
 # Run both per-day scripts first.  From the project root:
-#   Rscript optimisations/dilution_factors/compare_days.R [data_dir] [day2,day4]
+#   Rscript optimisations/dilution_factors/compare_days.R [data_dir] [day2,day4,...]
 # =============================================================================
 
 suppressPackageStartupMessages({
@@ -19,7 +19,12 @@ if (file.exists("Theme.R")) source("Theme.R") else
 
 args     <- commandArgs(trailingOnly = TRUE)
 data_dir <- if (length(args) >= 1) args[1] else "optimisations/dilution_factors"
-days     <- if (length(args) >= 2) strsplit(args[2], ",")[[1]] else c("day2", "day4")
+days     <- if (length(args) >= 2) strsplit(args[2], ",")[[1]] else {
+  # every all_features_dayN.csv in data_dir, in time order
+  f <- list.files(data_dir, "^all_features_day[0-9]+\\.csv$")
+  dd <- sub("^all_features_(day[0-9]+)\\.csv$", "\\1", f)
+  dd[order(as.integer(sub("day", "", dd)))]
+}
 NB_RUN   <- "all_dilutions"
 TOPK     <- 8L
 
@@ -130,44 +135,44 @@ fwrite(pw_wide, file.path(out_dir, "pathway_auc_by_day.csv"))
 message("\nExpected-pathway AUC by day:")
 print(pw_wide, digits = 2)
 
-# ---- 3. Do the nearest knockdowns persist from day to day? ------------------
+# ---- 3. Do the nearest knockdowns persist from one timepoint to the next? ---
 nb <- read_days(nbp("drug_neighbours_all_ranks.csv"))
 top <- nb[rank <= TOPK, .(set = list(neighbour), top3 = paste(neighbour[1:3], collapse = ", ")),
           by = .(day, anchor, cond)]
-pairs <- combn(days, 2, simplify = FALSE)
+pairs <- lapply(seq_len(length(days) - 1), function(i) days[i:(i + 1)])   # consecutive
 persist <- rbindlist(lapply(pairs, function(pr) {
-  a <- top[day == pr[1]]; b <- top[day == pr[2]]
-  m <- merge(a, b, by = c("anchor", "cond"), suffixes = c("_a", "_b"))
-  m[, .(anchor, cond, comparison = paste(pr, collapse = " vs "),
-        n_shared = mapply(function(x, y) length(intersect(x, y)), set_a, set_b),
-        shared = mapply(function(x, y) paste(intersect(x, y), collapse = ", "), set_a, set_b),
-        top3_a = top3_a, top3_b = top3_b)]
+  m <- merge(top[day == pr[1]], top[day == pr[2]], by = c("anchor", "cond"),
+             suffixes = c("_from", "_to"))
+  rk <- dcast(nb[day %in% pr], anchor + cond + neighbour ~ day, value.var = "rank")
+  rho <- rk[, .(spearman = cor(get(pr[1]), get(pr[2]), method = "spearman")), by = .(anchor, cond)]
+  m <- m[, .(anchor, cond, comparison = paste(pr, collapse = " -> "),
+             n_shared = mapply(function(x, y) length(intersect(x, y)), set_from, set_to),
+             shared = mapply(function(x, y) paste(intersect(x, y), collapse = ", "), set_from, set_to),
+             top3_from = top3_from, top3_to = top3_to)]
+  merge(m, rho, by = c("anchor", "cond"))
 }))
-# Rank agreement over all 67 strains
-rk <- dcast(nb, anchor + cond + neighbour ~ day, value.var = "rank")
-persist <- merge(persist, rk[, .(spearman = cor(get(days[1]), get(days[2]), method = "spearman")),
-                             by = .(anchor, cond)], by = c("anchor", "cond"))
-setnames(persist, c("top3_a", "top3_b"), paste0("top3_", days[1:2]))
 fwrite(persist, file.path(out_dir, "neighbour_persistence.csv"))
-message("\nTop-", TOPK, " neighbours shared between days:")
-print(persist[, -"comparison"], digits = 2)
+message("\nTop-", TOPK, " neighbours shared between consecutive timepoints:")
+print(persist[, .(comparison, anchor, cond, n_shared, spearman = round(spearman, 2),
+                  top3_from, top3_to)])
 
 persist[, `:=`(drug = sub("_.*", "", cond),
                conc = factor(sub(".*_", "", cond), levels = conc_levels),
-               anchor_lab = factor(anchor_labs[anchor], levels = anchor_labs))]
+               anchor_lab = factor(anchor_labs[anchor], levels = anchor_labs),
+               comparison = factor(comparison, levels = sapply(pairs, paste, collapse = " -> ")))]
 p4 <- ggplot(persist, aes(conc, n_shared, fill = drug)) +
   geom_col(position = position_dodge(width = 0.8, preserve = "single"), width = 0.75) +
   geom_text(aes(label = sprintf("%.2f", spearman), group = drug, y = n_shared + 0.35),
             position = position_dodge(width = 0.8), size = 2.4) +
   scale_fill_Publication() +
   scale_y_continuous(limits = c(0, TOPK + 0.8), breaks = 0:TOPK) +
-  facet_wrap(~ anchor_lab) +
+  facet_grid(comparison ~ anchor_lab) +
   labs(x = "Dose", y = sprintf("Top-%d neighbours shared", TOPK),
-       title = sprintf("Neighbour persistence, %s vs %s", days[1], days[2]),
-       subtitle = "Bars = knockdowns in both days' top 8; labels = Spearman correlation of all 67 ranks") +
+       title = "Neighbour persistence between consecutive timepoints",
+       subtitle = sprintf("Bars = knockdowns in both timepoints' top %d; labels = Spearman correlation of all 67 ranks", TOPK)) +
   theme_Publication(base_size = 11) +
   theme(legend.position = "bottom", legend.direction = "horizontal",
         plot.subtitle = element_text(size = 8))
-save_fig(p4, "04_neighbour_persistence", 10, 4.8)
+save_fig(p4, "04_neighbour_persistence", 10, 2.4 + 2.6 * length(pairs))
 
 message("\nDone. Tables in ", out_dir, " | figures in ", fig_dir)

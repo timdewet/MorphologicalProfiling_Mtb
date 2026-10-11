@@ -14,7 +14,7 @@
 #
 # Run from the project root:
 #   Rscript optimisations/dilution_factors/drug_vs_knockdown_shape.R \
-#     [data_dir] [library_dir] [day2,day4]
+#     [data_dir] [library_dir] [day2,day4,...]
 # Outputs -> <data_dir>/shape_vs_knockdowns/
 # =============================================================================
 
@@ -31,7 +31,12 @@ if (file.exists("Theme.R")) source("Theme.R") else
 args     <- commandArgs(trailingOnly = TRUE)
 data_dir <- if (length(args) >= 1) args[1] else "optimisations/dilution_factors"
 lib_dir  <- if (length(args) >= 2) args[2] else "input_data/iniB_allstrains"
-days     <- if (length(args) >= 3) strsplit(args[3], ",")[[1]] else c("day2", "day4")
+days     <- if (length(args) >= 3) strsplit(args[3], ",")[[1]] else {
+  # every all_features_dayN.csv in data_dir, in time order
+  f <- list.files(data_dir, "^all_features_day[0-9]+\\.csv$")
+  dd <- sub("^all_features_(day[0-9]+)\\.csv$", "\\1", f)
+  dd[order(as.integer(sub("day", "", dd)))]
+}
 
 out_dir <- file.path(data_dir, "shape_vs_knockdowns")
 fig_dir <- file.path(out_dir, "figures")
@@ -148,10 +153,11 @@ width_length_panel <- function(dy, legend) {
     theme(legend.position = if (legend) "right" else "none", legend.direction = "vertical",
           legend.title = element_text(size = 9), plot.subtitle = element_text(size = 8))
 }
-p1 <- (width_length_panel(days[1], FALSE) | width_length_panel(days[length(days)], TRUE)) +
+p1 <- wrap_plots(lapply(seq_along(days), function(i)
+  width_length_panel(days[i], legend = i == length(days))), nrow = 1) +
   plot_annotation(title = "Which shape axes match: width vs length",
                   theme = theme(plot.title = element_text(face = "bold", hjust = 0.5)))
-save_fig(p1, "01_width_vs_length", 13, 6.2)
+save_fig(p1, "01_width_vs_length", 1.5 + 5.8 * length(days), 6.2)
 
 # Reporter vs width: does iniB induction track widening in both systems?
 kd_rep <- rbindlist(lapply(days, function(dy) copy(kd)[, day := dy]))
@@ -173,6 +179,6 @@ p2 <- ggplot() +
   theme_Publication(base_size = 11) +
   theme(legend.position = "right", legend.direction = "vertical",
         legend.title = element_text(size = 9), plot.subtitle = element_text(size = 8))
-save_fig(p2, "02_reporter_vs_width", 12, 5.6)
+save_fig(p2, "02_reporter_vs_width", 3 + 4.5 * length(days), 5.6)
 
 message("\nDone. Tables in ", out_dir, " | figures in ", fig_dir)
